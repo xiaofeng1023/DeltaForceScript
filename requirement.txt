@@ -18,12 +18,18 @@ numpy==2.2.6
 #       PaddleOCR.predict() / text_detection_model_dir / rec_texts
 paddleocr==3.2.0
 
-# 默认安装 CPU 版 paddlepaddle, 无需 NVIDIA 显卡即可运行(速度稍慢)
-#paddlepaddle==3.2.1
+# ================= paddlepaddle =================
+# 默认装 CPU 版: 无需 NVIDIA 显卡即可运行(速度稍慢)。这里保持启用!
+paddlepaddle==3.2.1
 
-# 如需 GPU 加速(需本机 NVIDIA 显卡 + 匹配的 CUDA 驱动):
-#   1) 注释掉上面的 paddlepaddle==3.2.1
-#   2) 取消下面一行的注释
-#   3) 卸载后重装: pip uninstall -y paddlepaddle && pip install -r requirement.txt
-# 安装指引: https://www.paddlepaddle.org.cn/install/quick
-paddlepaddle-gpu==3.2.1
+# 如需 GPU 加速(NVIDIA 显卡 + 匹配的 CUDA 驱动), 注意:
+#   paddlepaddle-gpu 3.x 没有发布在 PyPI —— PyPI 上该包最高只到 2.6.2,
+#   把下面这行直接启用后装 3.2.1 会报
+#     "Could not find a version that satisfies the requirement paddlepaddle-gpu==3.2.1"
+#   必须改用 Paddle 官方源安装(按本机 CUDA 版本选 cu118 / cu126 / cu129 之一):
+#     .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
+#     .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+#   源地址与 CUDA 对应关系见: https://www.paddlepaddle.org.cn/install/quick
+# 说明: CPU 版(paddlepaddle)与 GPU 版(paddlepaddle-gpu)都提供 paddle 模块,
+#       两者同时安装时容易加载到 CPU 版, 所以装 GPU 前先按上面的命令卸载 CPU 版
+#paddlepaddle-gpu==3.2.1

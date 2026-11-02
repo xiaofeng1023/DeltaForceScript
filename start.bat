@@ -39,6 +39,14 @@ if not exist "%VENV_PY%" (
     echo [env] .venv created: %~dp0.venv
 )
 
+REM ---- 1.5) paddle wheels are python-version specific: warn when .venv python is not 3.10-3.12 ----
+"%VENV_PY%" -c "import sys; v=sys.version_info; print('[env] python ' + sys.version.split()[0]); sys.exit(0 if 310 <= v[0]*100+v[1] <= 312 else 1)"
+if errorlevel 1 (
+    echo [warn] this project is built and tested on Python 3.11.
+    echo        paddle wheels are python-version specific; if the install below fails,
+    echo        delete .venv and recreate it with Python 3.11.
+)
+
 REM ---- 2) check dependencies with the VENV interpreter (find_spec, no import) ----
 "%VENV_PY%" -c "import importlib.util as u, sys; mods=['cv2','numpy','PyQt6','dxcam','pydirectinput','win32api','PIL','paddle','paddleocr']; miss=[m for m in mods if u.find_spec(m) is None]; print('[env] missing: '+', '.join(miss)) if miss else print('[env] deps ok'); sys.exit(1 if miss else 0)"
 if errorlevel 1 (
@@ -46,9 +54,14 @@ if errorlevel 1 (
     "%VENV_PY%" -m pip install --upgrade pip
     "%VENV_PY%" -m pip install -r "%REQ%"
     if errorlevel 1 (
-        echo [error] dependency install failed, please check your network.
-        echo         Retry with a mirror:
-        echo         "%~dp0.venv\Scripts\python.exe" -m pip install -r requirement.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        echo [error] dependency install failed.
+        echo         1) GPU build: paddlepaddle-gpu 3.x is NOT published on PyPI
+        echo            only 2.6.2 and older are there, so "3.2.1" cannot be found.
+        echo            Install it from the Paddle index instead, then comment that line out:
+        echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+        echo         2) Python must be 3.11; paddle wheels are version specific.
+        echo         3) Slow network, retry with a mirror:
+        echo            "%~dp0.venv\Scripts\python.exe" -m pip install -r requirement.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
         pause
         exit /B 1
     )
