@@ -3,11 +3,26 @@
 # @Date: 2025-10-04
 # @Description: PyQt6 GUI 监控窗口
 
+import logging
+from datetime import datetime
+
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QLabel, QPushButton, QGroupBox, QTextEdit,
-                             QSpinBox, QDoubleSpinBox, QCheckBox)
+                             QSpinBox, QDoubleSpinBox, QCheckBox, QDialog, QComboBox,
+                             QLineEdit)
 from PyQt6.QtCore import Qt, pyqtSignal, QObject
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QImage, QPixmap
+
+logger = logging.getLogger(__name__)
+
+# 目标赛季可选列表。文字必须与游戏「筛选 → 赛季」下拉里的显示**逐字一致**，
+# 脚本是按 OCR 到的文字去匹配并点击的；下拉框仍是可编辑的，名单里没有的赛季
+# 可以直接手动输入。默认选中最后一项。
+SEASON_OPTIONS = (
+    "棱镜攻势", "美杜莎", "电玩高手", "命运王牌", "气象感应",
+    "棱镜攻势S2", "悬赏令", "电玩高手S2", "造物纪元", "群星",
+    "疾光魅影",
+)
 
 
 class ScriptController(QObject):
@@ -16,6 +31,7 @@ class ScriptController(QObject):
     stop_requested = pyqtSignal()
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
+    preview_requested = pyqtSignal()
 
 
 class MonitorWindow(QMainWindow):
@@ -30,26 +46,38 @@ class MonitorWindow(QMainWindow):
         self.is_paused = False
         self.minutes = "--"
         self.seconds = "--"
-        self.ocr_text = ""
-        self.confidence = 0.0
-        self.click_count = 0
         self.status = "就绪"
         
         # 配置变量
-        self.buy_click_delay = 0.50  # 购买点击延迟（秒）
+        # 识别到倒计时到点后、点第一下「购买」前的等待（秒）。抢购窗口只有 1 秒，
+        # 这段等待会直接变成比别人慢的时间，默认 0.30 秒留一点缓冲，想更快可调小（见 使用说明.md）
+        self.buy_click_delay = 0.30  # 购买点击延迟（秒）
         self.buy_to_verify_delay = 0.0  # 购买到确认的延迟（秒）
-        self.buy_interval = 0.05  # 购买按钮点击间隔（秒）
-        self.verify_interval = 0.05  # 确认按钮点击间隔（秒）
+        self.buy_interval = 0.30  # 购买按钮点击间隔（秒）
+        self.buy_clicks = 2  # 购买按钮连续点击次数
+        self.verify_interval = 0.07  # 确认按钮点击间隔（秒）
+        self.verify_clicks = 25  # 确认按钮连续点击次数
         self.ocr_interval = 0.95  # OCR识别间隔（time >= 5）（秒）
-        self.continue_after_complete = True  # 任务完成后继续运行
-        self.click_refresh_at_3s = True  # 3秒时点击刷新按钮
+        self.price_limit = 230  # 价格上限（三角币），超过则本轮不购买
+        self.click_refresh_enabled = True  # 倒计时剩余5秒时点击刷新（阈值见 main_gui.REFRESH_TRIGGER_SECONDS）
+        # 仅在我的关注页抢购：跳过整个准备阶段（不筛选、不自动加关注），
+        # 只抢自己关注列表里已有的商品；该模式下不检查价格上限
+        self.follow_only = False
+        self.target_season = SEASON_OPTIONS[-1]  # 要抢购的赛季（筛选弹窗里选择），默认最后一项
+        self.target_tier = "史诗品阶"          # 要抢购的品阶（四选一）
+        self.target_grade = "A"               # 要抢购的成色（所有成色/S/A/B/C 五选一）
+        self.stop_after_count = 0             # 抢到 N 个后停止，0 表示不限
+        # 市场每日关闭时段（HH:MM），处于该时段内脚本会自行停止
+        # 默认值与 main_gui.MARKET_CLOSE_TIME / MARKET_OPEN_TIME 保持一致
+        self.market_close_time = "05:00"      # 市场关闭时间
+        self.market_open_time = "08:00"       # 市场开市时间（需晚于关闭时间）
         
         self.init_ui()
         
     def init_ui(self):
         """初始化UI"""
         self.setWindowTitle("Delta Force 脚本监控")
-        self.setGeometry(100, 100, 350, 650)
+        self.setGeometry(100, 100, 350, 780)
         
         # 设置窗口始终置顶
         self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint)
@@ -60,6 +88,11 @@ class MonitorWindow(QMainWindow):
         
         # 主布局
         main_layout = QVBoxLayout()
+        # 窗口是置顶的，实际高度由 Qt 按各控件的 minimumSizeHint 撑开，setGeometry 里的
+        # 780 只是建议值。默认的间距/边距会把窗口顶到 840+ 像素，底部压到游戏结果页的
+        # 「跳过」区域（详见 main_gui.WINDOW_TOP_RATIO 的注释），这里收窄到最小
+        main_layout.setSpacing(3)
+        main_layout.setContentsMargins(3, 3, 3, 3)
         central_widget.setLayout(main_layout)
         
         # ========== 标题区域 ===========
@@ -71,7 +104,7 @@ class MonitorWindow(QMainWindow):
         main_layout.addWidget(title_label)
 
         # 小字提示
-        tip_label = QLabel("请将脚本放置在屏幕左下角，避免影响OCR结果")
+        tip_label = QLabel("窗口已停在屏幕右侧，请勿拖到画面左侧")
         tip_font = QFont("微软雅黑", 9)
         tip_label.setFont(tip_font)
         tip_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -218,6 +251,38 @@ class MonitorWindow(QMainWindow):
         verify_interval_layout.addStretch()
         config_layout.addLayout(verify_interval_layout)
         
+        # 购买连续点击次数
+        buy_clicks_layout = QHBoxLayout()
+        buy_clicks_label = QLabel("购买点击次数:")
+        buy_clicks_label.setFont(QFont("微软雅黑", 10))
+        buy_clicks_label.setFixedWidth(120)
+        self.buy_clicks_spin = QSpinBox()
+        self.buy_clicks_spin.setRange(1, 30)
+        self.buy_clicks_spin.setValue(self.buy_clicks)
+        self.buy_clicks_spin.setSuffix(" 次")
+        self.buy_clicks_spin.setFont(QFont("微软雅黑", 10))
+        self.buy_clicks_spin.valueChanged.connect(self.on_buy_clicks_changed)
+        buy_clicks_layout.addWidget(buy_clicks_label)
+        buy_clicks_layout.addWidget(self.buy_clicks_spin)
+        buy_clicks_layout.addStretch()
+        config_layout.addLayout(buy_clicks_layout)
+        
+        # 确认连续点击次数
+        verify_clicks_layout = QHBoxLayout()
+        verify_clicks_label = QLabel("确认点击次数:")
+        verify_clicks_label.setFont(QFont("微软雅黑", 10))
+        verify_clicks_label.setFixedWidth(120)
+        self.verify_clicks_spin = QSpinBox()
+        self.verify_clicks_spin.setRange(1, 30)
+        self.verify_clicks_spin.setValue(self.verify_clicks)
+        self.verify_clicks_spin.setSuffix(" 次")
+        self.verify_clicks_spin.setFont(QFont("微软雅黑", 10))
+        self.verify_clicks_spin.valueChanged.connect(self.on_verify_clicks_changed)
+        verify_clicks_layout.addWidget(verify_clicks_label)
+        verify_clicks_layout.addWidget(self.verify_clicks_spin)
+        verify_clicks_layout.addStretch()
+        config_layout.addLayout(verify_clicks_layout)
+        
         # OCR识别间隔
         ocr_interval_layout = QHBoxLayout()
         ocr_interval_label = QLabel("OCR间隔(t>5s):")
@@ -236,30 +301,93 @@ class MonitorWindow(QMainWindow):
         ocr_interval_layout.addStretch()
         config_layout.addLayout(ocr_interval_layout)
         
-        # 任务完成后继续运行选项
-        continue_layout = QHBoxLayout()
-        self.continue_checkbox = QCheckBox("任务完成后继续运行")
-        self.continue_checkbox.setFont(QFont("微软雅黑", 10))
-        self.continue_checkbox.setChecked(self.continue_after_complete)
-        self.continue_checkbox.stateChanged.connect(self.on_continue_changed)
-        self.continue_checkbox.setStyleSheet("""
-            QCheckBox {
-                padding: 5px;
-            }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-            }
-        """)
-        continue_layout.addWidget(self.continue_checkbox)
-        continue_layout.addStretch()
-        config_layout.addLayout(continue_layout)
+        # 价格上限
+        price_limit_layout = QHBoxLayout()
+        price_limit_label = QLabel("价格上限:")
+        price_limit_label.setFont(QFont("微软雅黑", 10))
+        price_limit_label.setFixedWidth(120)
+        self.price_limit_spin = QSpinBox()
+        self.price_limit_spin.setRange(0, 999999)
+        self.price_limit_spin.setValue(self.price_limit)
+        self.price_limit_spin.setSingleStep(10)
+        self.price_limit_spin.setSuffix(" 三角币")
+        self.price_limit_spin.setFont(QFont("微软雅黑", 10))
+        self.price_limit_spin.valueChanged.connect(self.on_price_limit_changed)
+        price_limit_layout.addWidget(price_limit_label)
+        price_limit_layout.addWidget(self.price_limit_spin)
+        price_limit_layout.addStretch()
+        config_layout.addLayout(price_limit_layout)
         
-        # 3秒时点击刷新选项
+        # 目标赛季（可编辑：赛季名称随版本更新，允许手动输入）
+        # 选项列表是弹出浮层，展开时覆盖在别的窗口上，不占主窗口高度，
+        # 因此赛季多几个也不会把窗口撑高（详见 main_gui.WINDOW_TOP_RATIO 的高度约束）
+        season_layout = QHBoxLayout()
+        season_label = QLabel("目标赛季:")
+        season_label.setFont(QFont("微软雅黑", 10))
+        season_label.setFixedWidth(120)
+        self.season_combo = QComboBox()
+        self.season_combo.setEditable(True)
+        self.season_combo.addItems(SEASON_OPTIONS)
+        self.season_combo.setCurrentText(self.target_season)
+        self.season_combo.setFont(QFont("微软雅黑", 10))
+        self.season_combo.currentTextChanged.connect(self.on_target_season_changed)
+        season_layout.addWidget(season_label)
+        season_layout.addWidget(self.season_combo)
+        season_layout.addStretch()
+        config_layout.addLayout(season_layout)
+
+        # 目标品阶（筛选弹窗里的四选一）
+        tier_layout = QHBoxLayout()
+        tier_label = QLabel("目标品阶:")
+        tier_label.setFont(QFont("微软雅黑", 10))
+        tier_label.setFixedWidth(120)
+        self.tier_combo = QComboBox()
+        self.tier_combo.addItems(["传说品阶", "史诗品阶", "稀有品阶", "普通品阶"])
+        self.tier_combo.setCurrentText(self.target_tier)
+        self.tier_combo.setFont(QFont("微软雅黑", 10))
+        self.tier_combo.currentTextChanged.connect(self.on_target_tier_changed)
+        tier_layout.addWidget(tier_label)
+        tier_layout.addWidget(self.tier_combo)
+        tier_layout.addStretch()
+        config_layout.addLayout(tier_layout)
+
+        # 目标成色（在售页成色筛选里的五选一）
+        grade_layout = QHBoxLayout()
+        grade_label = QLabel("目标成色:")
+        grade_label.setFont(QFont("微软雅黑", 10))
+        grade_label.setFixedWidth(120)
+        self.grade_combo = QComboBox()
+        self.grade_combo.addItems(["所有成色", "S", "A", "B", "C"])
+        self.grade_combo.setCurrentText(self.target_grade)
+        self.grade_combo.setFont(QFont("微软雅黑", 10))
+        self.grade_combo.currentTextChanged.connect(self.on_target_grade_changed)
+        grade_layout.addWidget(grade_label)
+        grade_layout.addWidget(self.grade_combo)
+        grade_layout.addStretch()
+        config_layout.addLayout(grade_layout)
+
+        # 抢到多少个后停止
+        stop_layout = QHBoxLayout()
+        stop_label = QLabel("抢到后停止:")
+        stop_label.setFont(QFont("微软雅黑", 10))
+        stop_label.setFixedWidth(120)
+        self.stop_count_spin = QSpinBox()
+        self.stop_count_spin.setRange(0, 999)
+        self.stop_count_spin.setValue(self.stop_after_count)
+        self.stop_count_spin.setSuffix(" 个")
+        self.stop_count_spin.setSpecialValueText("不限")
+        self.stop_count_spin.setFont(QFont("微软雅黑", 10))
+        self.stop_count_spin.valueChanged.connect(self.on_stop_count_changed)
+        stop_layout.addWidget(stop_label)
+        stop_layout.addWidget(self.stop_count_spin)
+        stop_layout.addStretch()
+        config_layout.addLayout(stop_layout)
+        
+        # 剩余5秒时点击刷新选项（阈值见 main_gui.REFRESH_TRIGGER_SECONDS）
         refresh_layout = QHBoxLayout()
-        self.refresh_checkbox = QCheckBox("剩余3秒时点击刷新")
+        self.refresh_checkbox = QCheckBox("剩余5秒时点击刷新")
         self.refresh_checkbox.setFont(QFont("微软雅黑", 10))
-        self.refresh_checkbox.setChecked(self.click_refresh_at_3s)
+        self.refresh_checkbox.setChecked(self.click_refresh_enabled)
         self.refresh_checkbox.stateChanged.connect(self.on_refresh_changed)
         self.refresh_checkbox.setStyleSheet("""
             QCheckBox {
@@ -271,8 +399,55 @@ class MonitorWindow(QMainWindow):
             }
         """)
         refresh_layout.addWidget(self.refresh_checkbox)
+        # 仅关注页模式。这个复选框必须和上面那个挤在同一行：单独占一行会把窗口
+        # 撑高约 28px，而窗口底边现在就已经压到游戏「跳过」按钮上方了（见
+        # main_gui.WINDOW_TOP_RATIO 的说明）。两个复选框合计 297px < 行宽 344px
+        self.follow_only_checkbox = QCheckBox("仅在我的关注页抢购")
+        self.follow_only_checkbox.setFont(QFont("微软雅黑", 10))
+        self.follow_only_checkbox.setChecked(self.follow_only)
+        self.follow_only_checkbox.setToolTip(
+            "勾选后跳过准备阶段：不筛选商品、不自动加关注，只抢「我的关注」里已有的商品。\n"
+            "该模式不检查价格上限；列表抢完后原地提醒，您手动加好关注脚本会自动继续")
+        self.follow_only_checkbox.stateChanged.connect(self.on_follow_only_changed)
+        self.follow_only_checkbox.setStyleSheet("""
+            QCheckBox {
+                padding: 5px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+        """)
+        refresh_layout.addWidget(self.follow_only_checkbox)
         refresh_layout.addStretch()
         config_layout.addLayout(refresh_layout)
+
+        # 市场每日关闭时段：处于 [关闭时间, 开市时间) 内脚本会自动停止
+        # （判定逻辑见 main_gui._market_closed）。两个时间都按 HH:MM 填
+        market_layout = QHBoxLayout()
+        market_label = QLabel("市场关闭时段:")
+        market_label.setFont(QFont("微软雅黑", 10))
+        market_label.setFixedWidth(120)
+        self.market_close_edit = QLineEdit(self.market_close_time)
+        self.market_close_edit.setFixedWidth(60)
+        self.market_close_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.market_close_edit.setFont(QFont("微软雅黑", 10))
+        self.market_close_edit.setToolTip("市场每天的关门时间，格式 HH:MM")
+        market_tilde = QLabel("~")
+        market_tilde.setFont(QFont("微软雅黑", 10))
+        self.market_open_edit = QLineEdit(self.market_open_time)
+        self.market_open_edit.setFixedWidth(60)
+        self.market_open_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.market_open_edit.setFont(QFont("微软雅黑", 10))
+        self.market_open_edit.setToolTip("市场重新开市时间，格式 HH:MM，需晚于关闭时间")
+        self.market_close_edit.textChanged.connect(self.on_market_time_changed)
+        self.market_open_edit.textChanged.connect(self.on_market_time_changed)
+        market_layout.addWidget(market_label)
+        market_layout.addWidget(self.market_close_edit)
+        market_layout.addWidget(market_tilde)
+        market_layout.addWidget(self.market_open_edit)
+        market_layout.addStretch()
+        config_layout.addLayout(market_layout)
         
         main_layout.addWidget(config_group)
         
@@ -294,6 +469,9 @@ class MonitorWindow(QMainWindow):
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(100)
+        # 明确给一个很小的最小高度：日志框默认的最小高度会把整个窗口顶高 60 多像素，
+        # 而窗口是置顶的，底部会压到游戏结果页的「跳过」区域（详见 main_gui.WINDOW_TOP_RATIO）
+        self.log_text.setMinimumHeight(26)
         self.log_text.setStyleSheet("""
             QTextEdit {
                 background-color: #263238;
@@ -375,6 +553,23 @@ class MonitorWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.on_stop_clicked)
         button_layout.addWidget(self.stop_btn)
         
+        self.preview_btn = QPushButton("👁 预览")
+        self.preview_btn.setFont(QFont("微软雅黑", 9))
+        self.preview_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #673AB7;
+                color: white;
+                border: none;
+                padding: 6px 10px;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #5E35B1;
+            }
+        """)
+        self.preview_btn.clicked.connect(self.on_preview_clicked)
+        button_layout.addWidget(self.preview_btn)
+        
         main_layout.addLayout(button_layout)
         
         # 添加弹性空间
@@ -422,11 +617,6 @@ class MonitorWindow(QMainWindow):
         except:
             pass
     
-    def update_ocr(self, text, confidence):
-        """更新OCR信息"""
-        self.ocr_text = text
-        self.confidence = confidence
-    
     def on_delay_changed(self, value):
         """购买点击延迟变更"""
         self.buy_click_delay = value
@@ -447,22 +637,69 @@ class MonitorWindow(QMainWindow):
         self.verify_interval = value
         self.add_log(f"⚙️ 确认点击间隔已设置为: {value}秒")
     
+    def on_buy_clicks_changed(self, value):
+        """购买点击次数变更"""
+        self.buy_clicks = value
+        self.add_log(f"⚙️ 购买点击次数已设置为: {value}次")
+
+    def on_verify_clicks_changed(self, value):
+        """确认点击次数变更"""
+        self.verify_clicks = value
+        self.add_log(f"⚙️ 确认点击次数已设置为: {value}次")
+
     def on_ocr_interval_changed(self, value):
         """OCR识别间隔变更"""
         self.ocr_interval = value
         self.add_log(f"⚙️ OCR识别间隔已设置为: {value}秒")
     
-    def on_continue_changed(self, state):
-        """任务完成后继续运行选项变更"""
-        self.continue_after_complete = (state == 2)  # Qt.CheckState.Checked = 2
-        status = "继续运行" if self.continue_after_complete else "停止"
-        self.add_log(f"⚙️ 任务完成后将: {status}")
+    def on_price_limit_changed(self, value):
+        """价格上限变更"""
+        self.price_limit = value
+        self.add_log(f"⚙️ 价格上限已设置为: {value}三角币")
+    
+    def on_target_season_changed(self, value):
+        """目标赛季变更"""
+        self.target_season = value.strip()
+        self.add_log(f"⚙️ 目标赛季已设置为: {self.target_season}")
+
+    def on_target_tier_changed(self, value):
+        """目标品阶变更"""
+        self.target_tier = value
+        self.add_log(f"⚙️ 目标品阶已设置为: {value}")
+
+    def on_target_grade_changed(self, value):
+        """目标成色变更"""
+        self.target_grade = value
+        self.add_log(f"⚙️ 目标成色已设置为: {value}")
+
+    def on_stop_count_changed(self, value):
+        """抢到 N 个后停止"""
+        self.stop_after_count = value
+        status = "不限" if value == 0 else f"{value} 个"
+        self.add_log(f"⚙️ 抢购数量上限已设置为: {status}")
     
     def on_refresh_changed(self, state):
-        """3秒时点击刷新选项变更"""
-        self.click_refresh_at_3s = (state == 2)  # Qt.CheckState.Checked = 2
-        status = "启用" if self.click_refresh_at_3s else "禁用"
-        self.add_log(f"⚙️ 3秒时点击刷新: {status}")
+        """剩余5秒时点击刷新选项变更"""
+        self.click_refresh_enabled = self.refresh_checkbox.isChecked()
+        status = "启用" if self.click_refresh_enabled else "禁用"
+        self.add_log(f"⚙️ 剩余5秒时点击刷新: {status}")
+
+    def on_follow_only_changed(self, state):
+        """仅在我的关注页抢购 选项变更"""
+        self.follow_only = self.follow_only_checkbox.isChecked()
+        status = "启用" if self.follow_only else "禁用"
+        self.add_log(f"⚙️ 仅在我的关注页抢购: {status}")
+
+    def on_market_time_changed(self, _text):
+        """市场关闭/开市时间变更
+
+        不做格式校验，直接透传给主逻辑：时间填错或填反时 main_gui._market_closed
+        会返回 False（即不启用该功能），不会把脚本永久挡住
+        """
+        self.market_close_time = self.market_close_edit.text().strip()
+        self.market_open_time = self.market_open_edit.text().strip()
+        self.add_log(f"⚙️ 市场关闭时段已设置为: "
+                     f"{self.market_close_time or '未填'} ~ {self.market_open_time or '未填'}")
     
     def get_config(self):
         """获取当前配置"""
@@ -470,25 +707,29 @@ class MonitorWindow(QMainWindow):
             'buy_click_delay': self.buy_click_delay,
             'buy_to_verify_delay': self.buy_to_verify_delay,
             'buy_interval': self.buy_interval,
+            'buy_clicks': self.buy_clicks,
             'verify_interval': self.verify_interval,
+            'verify_clicks': self.verify_clicks,
             'ocr_interval': self.ocr_interval,
-            'continue_after_complete': self.continue_after_complete,
-            'click_refresh_at_3s': self.click_refresh_at_3s
+            'price_limit': self.price_limit,
+            'click_refresh_enabled': self.click_refresh_enabled,
+            'follow_only': self.follow_only,
+            'target_season': self.target_season,
+            'target_tier': self.target_tier,
+            'target_grade': self.target_grade,
+            'stop_after_count': self.stop_after_count,
+            'market_close_time': self.market_close_time,
+            'market_open_time': self.market_open_time,
         }
-    
-    def increment_clicks(self):
-        """增加点击次数（保留用于兼容性）"""
-        self.click_count += 1
     
     def add_log(self, message):
         """添加日志"""
-        from datetime import datetime
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_text.append(f"[{timestamp}] {message}")
-        # 自动滚动到底部
         self.log_text.verticalScrollBar().setValue(
             self.log_text.verticalScrollBar().maximum()
         )
+        logger.info(message)
     
     def on_start_clicked(self):
         """开始按钮点击"""
@@ -529,6 +770,25 @@ class MonitorWindow(QMainWindow):
         self.update_status("已停止")
         self.add_log("⏹ 脚本已停止")
         self.controller.stop_requested.emit()
+
+    def on_preview_clicked(self):
+        """预览区域按钮点击"""
+        self.add_log("👁 正在生成区域预览...")
+        self.controller.preview_requested.emit()
+
+    def show_preview(self, pixmap):
+        """显示区域预览对话框"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("区域预览")
+        layout = QVBoxLayout(dialog)
+        label = QLabel()
+        scaled = pixmap.scaled(1280, 720, Qt.AspectRatioMode.KeepAspectRatio,
+                               Qt.TransformationMode.SmoothTransformation)
+        label.setPixmap(scaled)
+        layout.addWidget(label)
+        dialog.setLayout(layout)
+        dialog.exec()
+        self.add_log("👁 预览已关闭")
     
     def on_complete(self):
         """任务完成"""

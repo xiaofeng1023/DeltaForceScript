@@ -5,10 +5,14 @@
 # @FilePath: /DeltaForceScript/window_capture.py
 # @Description: 窗口截图工具 - 包含Windows Graphics Capture API支持
 
+import logging
+
 import dxcam
 import win32gui
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 def enum_windows_with_title():
     """枚举所有窗口并显示标题"""
@@ -24,35 +28,39 @@ def enum_windows_with_title():
     return windows
 
 class WindowCapture():
-    def __init__(self, device_idx: int = 0, output_idx: int = 0, target_fps: int = 500, max_buffer_len: int = 8):
+    def __init__(self, device_idx: int = 0, output_idx: int = 0, max_buffer_len: int = 8):
         """初始化窗口捕获
         
         Args:
             device_idx: 设备索引
             output_idx: 输出屏幕索引（多屏幕时指定）
-            target_fps: 目标帧率
         """
-        print(dxcam.device_info())
-        print(dxcam.output_info())
+        logger.debug("DXGI 设备: %s", dxcam.device_info())
+        logger.debug("DXGI 输出: %s", dxcam.output_info())
         self.device_idx = device_idx
         self.output_idx = output_idx
         self.camera = dxcam.create(device_idx=device_idx, output_idx=output_idx, output_color="BGR", max_buffer_len=max_buffer_len)
-        self.camera.start(target_fps=target_fps, video_mode=True)
+        if self.camera is None:
+            raise RuntimeError(
+                f"窗口捕获初始化失败（device_idx={device_idx}, output_idx={output_idx}），请检查屏幕索引是否正确"
+            )
 
     def capture(self) -> np.ndarray:
-        img = self.camera.get_latest_frame()
-        return img
+        """抓取一帧画面；若当前没有新帧会返回 None"""
+        return self.camera.grab()
 
     def stop(self):
-        self.camera.stop()
+        if self.camera and self.camera.is_capturing:
+            self.camera.stop()
     
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
     wc = WindowCapture()
     from region_selector import RegionSelector
     selector = RegionSelector()
     selector.load_regions_from_file("regions_2k.json")
     frame = wc.capture()
-    region = selector.get_region("verify_check")
+    region = selector.get_region("verify")
     frame = frame[region[1]:region[3], region[0]:region[2]]
     # 打印中心色块颜色
     center_color = frame[frame.shape[0] // 2, frame.shape[1] // 2]

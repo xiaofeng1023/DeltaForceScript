@@ -1,0 +1,11 @@
+管理员权限运行终端：
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirement.txt
+.\.venv\Scripts\python.exe main_gui.py
+
+注意：不要用 activate 之后的裸 pip / python，那样依赖会装进系统全局 Python，
+虚拟环境里依然缺包、程序起不来。
+
+也可以直接双击 start.bat：
+它会自动提权、缺 .venv 就创建、并用 .venv 自己的解释器把依赖装进虚拟环境，最后启动界面。
