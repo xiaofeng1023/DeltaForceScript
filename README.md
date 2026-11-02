@@ -104,7 +104,13 @@ python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
 
-没有 NVIDIA 显卡时回退 CPU 版（PyPI 上最高 3.3.1）：`.\.venv\Scripts\python.exe -m pip install paddlepaddle==3.2.1`。
+没有 NVIDIA 显卡时回退 CPU 版：PyPI 上 `paddlepaddle` 最高只到 3.3.1，3.4.0 同样只在 Paddle 官方
+cpu 源里，所以也要用 `--extra-index-url`：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle-gpu
+.\.venv\Scripts\python.exe -m pip install paddlepaddle==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
+```
 
 
 ## 快速开始（运行步骤）

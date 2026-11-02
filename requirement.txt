@@ -36,6 +36,8 @@ pydantic==2.13.4
 #   https://www.paddlepaddle.org.cn/install/quick
 # 装 GPU 版前先卸载 CPU 版, 否则可能加载到 CPU 版:
 #   .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
-# 没有 NVIDIA 显卡可回退 CPU 版(速度稍慢, PyPI 上最高 3.3.1):
-#   .\.venv\Scripts\python.exe -m pip install paddlepaddle==3.2.1
+# 没有 NVIDIA 显卡可回退 CPU 版(速度稍慢)。注意 PyPI 上 paddlepaddle 最高只到 3.3.1,
+# 3.4.0 只在 Paddle 官方 cpu 源里, 所以同样要用 --extra-index-url:
+#   .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle-gpu
+#   .\.venv\Scripts\python.exe -m pip install paddlepaddle==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
 #paddlepaddle-gpu==3.4.0

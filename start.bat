@@ -91,7 +91,7 @@ if errorlevel 1 (
         echo         Needs an NVIDIA GPU with a matching CUDA driver, and cu129 must match it.
         echo         Other CUDA builds: replace cu129 with cu118 / cu126 in the command above.
         echo         No NVIDIA GPU? Fall back to the CPU build:
-        echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle==3.2.1
+        echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
         pause
         exit /B 1
     )
