@@ -32,7 +32,8 @@ pydantic==2.13.4
 #  2) cu129 官方源里最高只有 3.4.0, 没有 3.4.1, 填 3.4.1 同样装不到
 # 正确命令(用 --extra-index-url 让其余依赖仍从 PyPI 取):
 #   .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
-# 其它 CUDA 版本把 cu129 换成 cu118 / cu126, 对应关系见
+# 其它 CUDA 版本: cu130 同样有 3.4.0; cu118 / cu126 最高只有 3.3.1, 那边要把版本号改成 3.3.1。
+# 对应关系见
 #   https://www.paddlepaddle.org.cn/install/quick
 # 装 GPU 版前先卸载 CPU 版, 否则可能加载到 CPU 版:
 #   .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle

@@ -89,7 +89,8 @@ if errorlevel 1 (
     if errorlevel 1 (
         echo [error] paddlepaddle-gpu install failed. Full pip log: install.log
         echo         Needs an NVIDIA GPU with a matching CUDA driver, and cu129 must match it.
-        echo         Other CUDA builds: replace cu129 with cu118 / cu126 in the command above.
+        echo         Other CUDA builds: cu130 also has 3.4.0; cu118 / cu126 top out at 3.3.1,
+        echo         so use paddlepaddle-gpu==3.3.1 there instead of 3.4.0.
         echo         No NVIDIA GPU? Fall back to the CPU build:
         echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cpu/
         pause

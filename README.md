@@ -97,7 +97,8 @@ python -m venv .venv
 
 **paddlepaddle 默认装 GPU 版**（需 NVIDIA 显卡 + 匹配 CUDA 驱动）。注意
 **`paddlepaddle-gpu` 3.x 没有发布在 PyPI**（PyPI 上最高只到 2.6.2），不能用 `-r requirement.txt` 装；
-而且 cu129 官方源**最高只有 3.4.0（没有 3.4.1）**。正确命令（`cu129` 按本机 CUDA 换成 `cu118` / `cu126` / `cu129`）：
+而且 cu129 官方源**最高只有 3.4.0（没有 3.4.1）**。正确命令（`cu130` 源里也有 3.4.0；
+`cu118` / `cu126` 最高只有 3.3.1，那边要把版本号改成 3.3.1）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
