@@ -95,6 +95,11 @@ python -m venv .venv
 > 也可以直接双击 `start.bat`：它会自动检验 `.venv` 是否存在、依赖是否**真的装在 `.venv` 里**，
 > 缺哪个就用 `.venv\Scripts\python.exe -m pip` 补装，再自动装 GPU 版 paddlepaddle，最后启动界面。
 
+> ✅ **已验证组合**（实机跑通）：Python 3.11.9 + `paddlepaddle-gpu==3.4.0`（cu129 源，装好后
+> `.venv\Lib\site-packages\` 下是 `paddlepaddle_gpu-3.4.0.dist-info`）+ `paddleocr==3.2.0`
+> + `pydantic==2.13.4`。装完可用
+> `.\.venv\Scripts\python.exe -c "import paddle; paddle.utils.run_check()"` 自查是否走 GPU。
+
 **paddlepaddle 默认装 GPU 版**（需 NVIDIA 显卡 + 匹配 CUDA 驱动）。注意
 **`paddlepaddle-gpu` 3.x 没有发布在 PyPI**（PyPI 上最高只到 2.6.2），不能用 `-r requirement.txt` 装；
 而且 cu129 官方源**最高只有 3.4.0（没有 3.4.1）**。正确命令（`cu130` 源里也有 3.4.0；
