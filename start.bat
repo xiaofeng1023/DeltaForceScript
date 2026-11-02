@@ -55,13 +55,28 @@ if errorlevel 1 (
     "%VENV_PY%" -m pip install -r "%REQ%"
     if errorlevel 1 (
         echo [error] dependency install failed.
-        echo         1) GPU build: paddlepaddle-gpu 3.x is NOT published on PyPI
-        echo            only 2.6.2 and older are there, so "3.2.1" cannot be found.
-        echo            Install it from the Paddle index instead, then comment that line out:
-        echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-        echo         2) Python must be 3.11; paddle wheels are version specific.
-        echo         3) Slow network, retry with a mirror:
+        echo         1) Python must be 3.11; paddle wheels are version specific.
+        echo         2) Slow network, retry with a mirror:
         echo            "%~dp0.venv\Scripts\python.exe" -m pip install -r requirement.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+        pause
+        exit /B 1
+    )
+)
+
+REM ---- 2.5) the GPU build is the default and it is NOT on PyPI: install it from the Paddle index ----
+REM paddlepaddle-gpu 3.x only exists on the Paddle official index, so it cannot be put in
+REM requirement.txt (pip -r would fail with "No matching distribution found").
+"%VENV_PY%" -c "import importlib.metadata as m, sys; v=[d.version for d in m.distributions() if d.metadata.get('Name','').lower()=='paddlepaddle-gpu']; sys.exit(0 if v and v[0].startswith('3.4.1') else 1)"
+if errorlevel 1 (
+    echo [env] installing paddlepaddle-gpu 3.4.1 from the Paddle cu129 index, this is a large download ...
+    "%VENV_PY%" -m pip uninstall -y paddlepaddle >nul 2>&1
+    "%VENV_PY%" -m pip install paddlepaddle-gpu==3.4.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+    if errorlevel 1 (
+        echo [error] paddlepaddle-gpu install failed.
+        echo         Needs an NVIDIA GPU with a matching CUDA driver, and cu129 must match it.
+        echo         Other CUDA builds: replace cu129 with cu118 / cu126 in the command above.
+        echo         No NVIDIA GPU? Fall back to the CPU build:
+        echo            "%~dp0.venv\Scripts\python.exe" -m pip install paddlepaddle==3.2.1
         pause
         exit /B 1
     )

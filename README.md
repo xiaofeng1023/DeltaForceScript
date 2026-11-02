@@ -93,16 +93,18 @@ python -m venv .venv
 ```
 
 > 也可以直接双击 `start.bat`：它会自动检验 `.venv` 是否存在、依赖是否**真的装在 `.venv` 里**，
-> 缺哪个就用 `.venv\Scripts\python.exe -m pip` 补装，再启动界面。
+> 缺哪个就用 `.venv\Scripts\python.exe -m pip` 补装，再自动装 GPU 版 paddlepaddle，最后启动界面。
 
-如果使用 GPU 的 `paddlepaddle-gpu`，请确保与本机 CUDA 驱动版本匹配（参见 PaddlePaddle 官方安装说明）。
-注意 **`paddlepaddle-gpu` 3.x 没有发布在 PyPI**（PyPI 上最高只到 2.6.2），不能用 `-r requirement.txt` 装，
-要按 CUDA 版本从 Paddle 官方源装：
+**paddlepaddle 默认装 GPU 版**（需 NVIDIA 显卡 + 匹配 CUDA 驱动）。注意
+**`paddlepaddle-gpu` 3.x 没有发布在 PyPI**（PyPI 上最高只到 2.6.2），不能用 `-r requirement.txt` 装，
+要从 Paddle 官方源装（`cu129` 按本机 CUDA 版本换成 `cu118` / `cu126` / `cu129`）：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
-.\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
+.\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
 ```
+
+没有 NVIDIA 显卡时回退 CPU 版：`.\.venv\Scripts\python.exe -m pip install paddlepaddle==3.2.1`。
 
 
 ## 快速开始（运行步骤）
