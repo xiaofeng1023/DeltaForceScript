@@ -1,9 +1,7 @@
 # ================= 运行环境依赖 =================
 # 适用: Windows 10 / 11 + Python 3.11 (开发与验证版本 3.11.9)
-# 安装(两步: 先装下面这些 PyPI 依赖, 再从 Paddle 官方源装 GPU 版 paddlepaddle):
-#   .\.venv\Scripts\python.exe -m pip install -r requirement.txt
-#   .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
-# (start.bat 会自动完成这两步, 一般不需要手动执行)
+# 安装: .\.venv\Scripts\python.exe -m pip install -r requirement.txt
+# (start.bat 会自动完成"装本文件 + 从 Paddle 官方源装 GPU 版 paddlepaddle"两步)
 
 # ---- 界面 / 屏幕捕获 / 输入模拟 ----
 PyQt6==6.9.1
@@ -20,20 +18,24 @@ numpy==2.2.6
 # 注意: 必须用 paddleocr 3.x。2.x 与 3.x 的接口完全不同, 代码依赖 3.x 的
 #       PaddleOCR.predict() / text_detection_model_dir / rec_texts
 paddleocr==3.2.0
+# 锁定 pydantic: paddlex 只要求 "pydantic>=2", 不锁的话解析器会挑最新版, 而最新的
+# pydantic 又要求刚发布不久的 pydantic-core, 镜像站往往还没同步到那个版本, 会报
+#   "some packages in these conflicts have no matching distributions
+#    available for your environment: pydantic-core"
+# 2.13.4 + pydantic-core 2.46.4 是本项目实测可用的组合
+pydantic==2.13.4
 
 # ================= paddlepaddle (默认 GPU 版) =================
-# 默认用 GPU 版: 需 NVIDIA 显卡 + 匹配的 CUDA 驱动(cu129)。
-# paddlepaddle-gpu 3.x 没有发布在 PyPI(PyPI 上该包最高只到 2.6.2), 所以下面这行
-# 必须保持注释 —— 不能靠 -r 装, 否则会报
-#   "Could not find a version that satisfies the requirement paddlepaddle-gpu==3.4.1"
-# 要用 Paddle 官方源单独安装:
-#   .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+# 默认装 GPU 版: 需 NVIDIA 显卡 + 匹配的 CUDA 驱动。注意两个坑:
+#  1) paddlepaddle-gpu 3.x 没有发布在 PyPI(PyPI 上最高只到 2.6.2), 下面这行必须保持
+#     注释, 不能靠 -r 装, 否则会报 "No matching distribution found for paddlepaddle-gpu"
+#  2) cu129 官方源里最高只有 3.4.0, 没有 3.4.1, 填 3.4.1 同样装不到
+# 正确命令(用 --extra-index-url 让其余依赖仍从 PyPI 取):
+#   .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/
 # 其它 CUDA 版本把 cu129 换成 cu118 / cu126, 对应关系见
 #   https://www.paddlepaddle.org.cn/install/quick
 # 装 GPU 版前先卸载 CPU 版, 否则可能加载到 CPU 版:
 #   .\.venv\Scripts\python.exe -m pip uninstall -y paddlepaddle
-# 没有 NVIDIA 显卡可回退 CPU 版(速度稍慢):
+# 没有 NVIDIA 显卡可回退 CPU 版(速度稍慢, PyPI 上最高 3.3.1):
 #   .\.venv\Scripts\python.exe -m pip install paddlepaddle==3.2.1
-# 若 GPU 版 3.4.1 与 paddleocr 3.2.0 出现接口不兼容, 可退回 GPU 版 3.2.1:
-#   .\.venv\Scripts\python.exe -m pip install paddlepaddle-gpu==3.2.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/
-#paddlepaddle-gpu==3.4.1
+#paddlepaddle-gpu==3.4.0

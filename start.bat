@@ -10,18 +10,25 @@ REM the console codepage is GBK (Chinese bytes can even swallow nearby chars).
 REM ====================================================================
 
 REM ---- 0) request admin rights (mouse simulation needs elevation) ----
->nul 2>&1 "%SYSTEMROOT%\system32\cacls.exe" "%SYSTEMROOT%\system32\config\system"
-if '%errorlevel%' NEQ '0' (
-    echo Set UAC = CreateObject^("Shell.Application"^) > "%temp%\getadmin.vbs"
-    echo UAC.ShellExecute "%~f0", "", "", "runas", 1 >> "%temp%\getadmin.vbs"
-    "%temp%\getadmin.vbs"
+REM "net session" fails with errorlevel 5/2 for non-admin; it is available on every Windows.
+REM The old cacls.exe probe + getadmin.vbs relaunch silently closed the window on machines
+REM where Windows Script Host is restricted, which looked like a flash-close with no message.
+net session >nul 2>&1
+if errorlevel 1 (
+    echo [env] administrator rights are required, relaunching with a UAC prompt ...
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "try { Start-Process -FilePath '%~f0' -WorkingDirectory '%~dp0' -Verb RunAs } catch { exit 1 }" >> "%~dp0start.log" 2>&1
+    if errorlevel 1 (
+        echo [error] failed to relaunch as administrator, details in start.log
+        echo         Try: right-click start.bat and choose "Run as administrator".
+        pause
+    )
     exit /B
 )
-if exist "%temp%\getadmin.vbs" ( del "%temp%\getadmin.vbs" )
 cd /d "%~dp0"
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 set "REQ=%~dp0requirement.txt"
+set "LOG=%~dp0install.log"
 
 REM ---- 1) create .venv when missing (only this step uses the system python) ----
 if not exist "%VENV_PY%" (
@@ -52,27 +59,35 @@ REM ---- 2) check dependencies with the VENV interpreter (find_spec, no import) 
 if errorlevel 1 (
     echo [env] installing dependencies into .venv, please wait ...
     "%VENV_PY%" -m pip install --upgrade pip
-    "%VENV_PY%" -m pip install -r "%REQ%"
+    "%VENV_PY%" -m pip install -r "%REQ%" --log "%LOG%"
     if errorlevel 1 (
-        echo [error] dependency install failed.
-        echo         1) Python must be 3.11; paddle wheels are version specific.
-        echo         2) Slow network, retry with a mirror:
-        echo            "%~dp0.venv\Scripts\python.exe" -m pip install -r requirement.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
-        pause
-        exit /B 1
+        REM PyPI or the network may be unstable in some regions: retry once via the tsinghua mirror
+        echo [env] install failed, retrying with the tsinghua mirror ...
+        "%VENV_PY%" -m pip install -r "%REQ%" --log "%LOG%" -i https://pypi.tuna.tsinghua.edu.cn/simple
+        if errorlevel 1 (
+            echo [error] dependency install failed. Full pip log: install.log
+            echo         Send install.log if you need help.
+            echo         Also make sure Python is 3.11; paddle wheels are version specific.
+            echo         Manual retry:
+            echo            "%~dp0.venv\Scripts\python.exe" -m pip install -r requirement.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+            pause
+            exit /B 1
+        )
     )
 )
 
 REM ---- 2.5) the GPU build is the default and it is NOT on PyPI: install it from the Paddle index ----
 REM paddlepaddle-gpu 3.x only exists on the Paddle official index, so it cannot be put in
 REM requirement.txt (pip -r would fail with "No matching distribution found").
-"%VENV_PY%" -c "import importlib.metadata as m, sys; v=[d.version for d in m.distributions() if d.metadata.get('Name','').lower()=='paddlepaddle-gpu']; sys.exit(0 if v and v[0].startswith('3.4.1') else 1)"
+REM The cu129 index tops out at 3.4.0 -- there is no 3.4.1, do not bump the version blindly.
+"%VENV_PY%" -c "import importlib.metadata as m, sys; v=[d.version for d in m.distributions() if d.metadata.get('Name','').lower()=='paddlepaddle-gpu']; sys.exit(0 if v and v[0].startswith('3.4.0') else 1)"
 if errorlevel 1 (
-    echo [env] installing paddlepaddle-gpu 3.4.1 from the Paddle cu129 index, this is a large download ...
+    echo [env] installing paddlepaddle-gpu 3.4.0 from the Paddle cu129 index, this is a large download ...
     "%VENV_PY%" -m pip uninstall -y paddlepaddle >nul 2>&1
-    "%VENV_PY%" -m pip install paddlepaddle-gpu==3.4.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu129/
+    REM --extra-index-url (not -i): the GPU wheel comes from Paddle, its deps still come from PyPI
+    "%VENV_PY%" -m pip install paddlepaddle-gpu==3.4.0 --extra-index-url https://www.paddlepaddle.org.cn/packages/stable/cu129/ --log "%LOG%"
     if errorlevel 1 (
-        echo [error] paddlepaddle-gpu install failed.
+        echo [error] paddlepaddle-gpu install failed. Full pip log: install.log
         echo         Needs an NVIDIA GPU with a matching CUDA driver, and cu129 must match it.
         echo         Other CUDA builds: replace cu129 with cu118 / cu126 in the command above.
         echo         No NVIDIA GPU? Fall back to the CPU build:
