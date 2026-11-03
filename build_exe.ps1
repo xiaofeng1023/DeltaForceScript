@@ -26,8 +26,7 @@ $app = "packaging\app"
 if (Test-Path $app) { Remove-Item $app -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $app | Out-Null
 $files = @("main_gui.py", "page_flow.py", "gui_monitor.py", "window_capture.py",
-           "region_selector.py", "requirement.txt", "regions_2k.json",
-           ([string][char]0x8FD0 + [char]0x884C + [char]0x6B65 + [char]0x9AA4 + ".txt"))
+           "region_selector.py", "requirement.txt", "regions_2k.json")
 foreach ($f in $files) {
     if (Test-Path $f) { Copy-Item $f $app }
 }

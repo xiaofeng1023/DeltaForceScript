@@ -31,7 +31,7 @@ PTH_NAME = "python311._pth"
 # 需要随 exe 一起带、首次解压到 exe 目录的文件
 SOURCE_FILES = [
     "main_gui.py", "page_flow.py", "gui_monitor.py", "window_capture.py",
-    "region_selector.py", "requirement.txt", "regions_2k.json", "运行步骤.txt",
+    "region_selector.py", "requirement.txt", "regions_2k.json",
 ]
 
 # 这些是用户自己的标定数据，不能直接覆盖：否则用户重标过的坐标会被内置版本冲掉。
