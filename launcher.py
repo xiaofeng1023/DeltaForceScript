@@ -15,6 +15,7 @@ exe 里带的是「环境」，不是「依赖」：
 """
 
 import ctypes
+import json
 import os
 import shutil
 import subprocess
@@ -32,6 +33,10 @@ SOURCE_FILES = [
     "main_gui.py", "page_flow.py", "gui_monitor.py", "window_capture.py",
     "region_selector.py", "requirement.txt", "regions_2k.json", "运行步骤.txt",
 ]
+
+# 这些是用户自己的标定数据，不能直接覆盖：否则用户重标过的坐标会被内置版本冲掉。
+# 处理方式是"内置作底、用户值优先"做 key 合并：既保留用户标定，又能补上新版本新增的区域
+USER_DATA_FILES = {"regions_2k.json"}
 
 # 依赖探测：只用 find_spec，不真的 import（import paddle 要好几秒）
 CHECK_CODE = (
@@ -118,14 +123,34 @@ def relaunch_as_admin():
 
 
 def copy_sources():
-    """把 exe 里的源码副本解压到 exe 目录（已存在就不覆盖，避免冲掉用户改动）"""
+    """把 exe 里的源码副本同步到 exe 目录
+
+    代码文件每次都覆盖：以前是"已存在就不覆盖"，结果把新版 exe 放到旧目录后
+    仍在跑旧代码（实机上踩过一次，日志里的新逻辑完全没有生效）。
+    regions_2k.json 属于用户数据，按 key 合并：内置版本作底、用户标定的值优先，
+    既不会冲掉用户标定，又能补上新版本新增的区域。
+    """
     src = payload_dir() / "app"
     if not src.exists():
         return
     for name in SOURCE_FILES:
+        source = src / name
+        if not source.exists():
+            continue
         target = app_dir() / name
-        if not target.exists() and (src / name).exists():
-            shutil.copy2(src / name, target)
+        if name in USER_DATA_FILES and target.exists():
+            try:
+                with open(source, encoding="utf-8") as f:
+                    builtin = json.load(f)
+                with open(target, encoding="utf-8") as f:
+                    user = json.load(f)
+                with open(target, "w", encoding="utf-8") as f:
+                    json.dump({**builtin, **user}, f, indent=2, ensure_ascii=False)
+                    f.write("\n")
+            except Exception as exc:
+                print(f"[warn] 合并 {name} 失败，保留现有文件: {exc}")
+            continue
+        shutil.copy2(source, target)
 
 
 def ensure_runtime():
