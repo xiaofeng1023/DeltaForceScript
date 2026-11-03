@@ -9,6 +9,8 @@ import sys
 import re
 import time
 import random
+
+import numpy as np
 import ctypes
 import logging
 # 设置 PaddleOCR 模型下载国内镜像（加速下载）
@@ -94,7 +96,8 @@ WINDOW_LEFT_RATIO = 2300 / 2560
 WINDOW_TOP_RATIO = 375 / 1440
 # 倒计时剩余多少秒时点击刷新（修改后需同步 gui_monitor.py 中复选框的文案）
 REFRESH_TRIGGER_SECONDS = 5
-# 连续多少次未检测到扣款即判定为界面卡死，触发恢复动作
+# 连续多少轮"未检测到扣款"就提示一次。市场按随机抽选发放购买资格，连续未中签是正常现象，
+# 因此这里只输出提示、不再触发任何界面恢复动作（旧逻辑会按 ESC，反而打乱关注页）
 MAX_FAIL_COUNT = 10
 # 购买+确认点完、按返回键回到关注列表后，等余额刷新再识别三角币的时间（秒）
 POST_BUY_SETTLE_SECONDS = 1.0
@@ -143,6 +146,143 @@ PREPARE_POLL_INTERVAL = 0.3
 MODEL_ROOT = "models"
 # 倒计时文本："N分M秒"
 COUNTDOWN_PATTERN = re.compile(r'(\d+)\s*分\s*(\d+)\s*秒')
+
+# ========== 倒计时像素差分 ==========
+# 抢购热路径上每轮都要 OCR 一次倒计时（det+rec，GPU 约 40~90 ms，CPU 上 100~200 ms），
+# 而倒计时数字每秒才变一次 —— 画面没变时再识别一遍是纯浪费。
+# 改法：每轮只把倒计时区域缩成小图做像素差分（~0.3 ms），
+#   1. 画面没变        -> 缓存值继续有效，跳过 OCR（决策零延迟）
+#   2. 画面一秒一跳    -> 本地值 -1，不做 OCR（只有读数字时才需要 OCR）
+#   3. 整块画面都变了  -> 页面切换/弹窗/刷新出新轮，强制 OCR 重新取权威值
+#   4. 数值掉到 3 秒   -> OCR 校准一次，之后 2 秒、1 秒靠本地递减（购买决策不等 OCR）
+#   5. 超过 3 秒没识别 -> 定期校准一次，防止递减漂移
+#   6. 一秒内变好几次  -> 数字切换动画/意外抖动，连续几次后退回逐轮 OCR（行为同改前）
+COUNTDOWN_SIG_SIZE = (128, 48)      # 差分用的小图尺寸：够分辨数字，又足够快
+COUNTDOWN_PIXEL_DELTA = 18          # 单像素灰度差超过它才算"这个点变了"
+COUNTDOWN_CHANGED_RATIO = 0.005     # 变化像素占比 ≥0.5% 才认为数字变了（抗区域大小差异）
+COUNTDOWN_BIG_RATIO = 0.25          # 变化像素占比 ≥25% 视为整块画面更换，直接 OCR
+COUNTDOWN_CHANGE_MIN_GAP = 0.35     # 倒计时不可能比这更快地跳一格
+COUNTDOWN_CONFIRM_AT = 3            # 数值到 3 秒时 OCR 校准一次
+COUNTDOWN_RESYNC_SECONDS = 3.0      # 这么久没 OCR 过就校准一次（只对剩余 10 秒内生效）
+# 最后 3 秒（购买决策区间）校准更勤一些：万一画面卡住不动，也不会拿旧值连着点
+COUNTDOWN_RESYNC_FAST_SECONDS = 1.5
+COUNTDOWN_UNSTABLE_LIMIT = 3        # 连续这么多次"跳太快"就退回纯 OCR
+
+
+class CountdownWatcher:
+    """用像素差分代替"每轮 OCR"来跟踪倒计时
+
+    update() 返回 (kind, total_seconds):
+        ("value", n)     剩余 n 秒（OCR 权威值，或按跳秒本地递减得到）
+        ("long", None)   倒计时按"天/小时"显示（市场还没开）
+        ("unknown", None) 区域里没有可识别的倒计时（可能已不在关注页）
+    """
+
+    def __init__(self):
+        self.auto = True          # False = 差分不可靠，退回逐轮 OCR
+        self._sig = None          # 上一次 OCR 时的画面签名
+        self._value = None        # 上一次 OCR 得到的剩余秒数
+        self._last_change_at = 0.0
+        self._last_ocr_at = 0.0
+        self._fast_hits = 0
+
+    def reset(self):
+        """页面可能已切换：丢掉签名与缓存值，下一轮重新 OCR"""
+        self._sig = None
+        self._value = None
+        self._last_change_at = 0.0
+        self._fast_hits = 0
+        # 重新给差分一次机会。以前 auto=False 是"一降级就永久逐轮 OCR"：实测
+        # 11:28~11:30 连续降级 4 次后，整晚都在逐轮 OCR，像素差分优化实际没生效
+        self.auto = True
+
+    def value(self):
+        """最近一次确认的剩余秒数（None 表示还不知道）"""
+        return self._value
+
+    @staticmethod
+    def signature(frame, region):
+        """倒计时区域的灰度缩略图；区域截不到时返回 None"""
+        if frame is None or frame.size == 0:
+            return None
+        left, top, right, bottom = region
+        height, width = frame.shape[:2]
+        left, right = max(0, int(left)), min(width, int(right))
+        top, bottom = max(0, int(top)), min(height, int(bottom))
+        if right <= left or bottom <= top:
+            return None
+        gray = cv2.cvtColor(frame[top:bottom, left:right], cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, COUNTDOWN_SIG_SIZE, interpolation=cv2.INTER_AREA)
+
+    @staticmethod
+    def _changed_ratio(sig, base):
+        """明显变化的像素占比（按比例判断，避免区域大小影响阈值）"""
+        delta = cv2.absdiff(sig, base)
+        _, mask = cv2.threshold(delta, COUNTDOWN_PIXEL_DELTA, 255, cv2.THRESH_BINARY)
+        return float(np.count_nonzero(mask)) / mask.size
+
+    def update(self, frame, region, read):
+        """根据当前画面返回倒计时状态；read 是一个"做一次 OCR 并返回文本"的回调"""
+        sig = self.signature(frame, region)
+        if not self.auto:
+            return self._read(read, sig)
+        if sig is None:
+            return ("unknown", None)
+        if self._sig is None or self._value is None:
+            return self._read(read, sig)
+
+        ratio = self._changed_ratio(sig, self._sig)
+        now = time.time()
+        if ratio < COUNTDOWN_CHANGED_RATIO:
+            # 画面没变 -> 显示的仍是缓存那个数；只在剩余时间不大时定期校准
+            resync = (COUNTDOWN_RESYNC_FAST_SECONDS if self._value <= 3
+                      else COUNTDOWN_RESYNC_SECONDS)
+            if self._value <= 10 and now - self._last_ocr_at > resync:
+                return self._read(read, sig)
+            return ("value", self._value)
+        if ratio >= COUNTDOWN_BIG_RATIO:
+            # 整块画面换了（切页面/弹窗/刷新出新轮）：缓存值不可信
+            self._last_change_at = now
+            return self._read(read, sig)
+
+        gap = now - self._last_change_at
+        self._last_change_at = now
+        if gap < COUNTDOWN_CHANGE_MIN_GAP:
+            # 比"一秒一跳"快得多：数字切换动画或画面抖动，用 OCR 兜底
+            self._fast_hits += 1
+            if self._fast_hits >= COUNTDOWN_UNSTABLE_LIMIT:
+                self.auto = False
+                logger.warning("[倒计时] 差分判定抖动过多，已退回逐轮 OCR（不影响功能）")
+            return self._read(read, sig)
+        self._fast_hits = 0
+
+        nxt = self._value - 1
+        if nxt < 0 or nxt == COUNTDOWN_CONFIRM_AT:
+            # 归零/刷新后跳回大数值/到 3 秒：用 OCR 拿权威值
+            return self._read(read, sig)
+        # 正常跳秒：本地递减，购买决策走这条路径，不需要等 OCR
+        self._value = nxt
+        self._sig = sig
+        return ("value", nxt)
+
+    def _read(self, read, sig):
+        """做一次 OCR 并更新缓存；读不到就清空状态交由调用方兜底"""
+        text = read() or ""
+        self._last_ocr_at = time.time()
+        if "天" in text or "小时" in text:
+            self._value = None
+            self._sig = sig
+            return ("long", None)
+        match = COUNTDOWN_PATTERN.search(text)
+        if not match:
+            self.reset()
+            return ("unknown", None)
+        total = int(match.group(1)) * 60 + int(match.group(2))
+        self._value = total
+        self._sig = sig
+        return ("value", total)
+
+
 # 页面标识 -> 中文名，仅用于状态栏与日志展示
 PAGE_NAMES = {
     PAGE_BROWSE: "典藏外观列表",
@@ -351,6 +491,7 @@ class ScriptThread(QThread):
         self.ocr = ocr
         self._get_config = config_provider
         self._price_region_warned = False    # "未配置价格区域"的告警是否已输出过
+        self._price_fallback_warned = False  # 详情面板价格读不到、改用卡片价格兜底的提示是否已输出过
         self.is_running = True
         self.is_paused = False
 
@@ -377,6 +518,7 @@ class ScriptThread(QThread):
         self.return_follow_rounds = 0    # 抢购阶段连续尝试导航回关注页的轮数
         self.follow_sort_tries = 0        # 本次进入关注页已尝试设置排序的轮数
         self.snipe_live = False          # 上一轮是否读到过倒计时（用于跳过重复的页面识别）
+        self.countdown = CountdownWatcher()  # 倒计时像素差分：大多数轮次不再 OCR
         self.prepare_unknown_rounds = 0  # 准备阶段连续识别不出页面的轮数
         self.recover_count = 0           # 连续自动恢复的次数（真正有进展时清零）
         self.capture_fail_count = 0      # 连续截屏失败的次数
@@ -439,6 +581,7 @@ class ScriptThread(QThread):
         self.return_follow_rounds = 0
         self.follow_sort_tries = 0
         self.snipe_live = False
+        self.countdown.reset()
         self.follow_wait_notified = False
         self.stall_warned = False
         self.last_progress_time = time.time()
@@ -480,6 +623,7 @@ class ScriptThread(QThread):
         self.return_follow_rounds = 0
         # 只重置列表上下文，赛季/品阶筛选结果保留（游戏端仍然生效）
         self.flow.reset_prepare_context()
+        self.countdown.reset()
         self.mark_progress()
 
     def _nav_back_to_follow(self, page, frame):
@@ -619,6 +763,11 @@ class ScriptThread(QThread):
             page: 当前识别到的页面
             frame: 当前画面，用于结果页判定
         """
+        # 暂停/停止后绝不再操作游戏：用户暂停往往就是为了手动接管画面，
+        # 此时再点刷新或按 ESC 会把用户的页面打乱（实测日志 19:10:59 已暂停，
+        # 19:11:03 仍在执行 [防卡死] 恢复）
+        if self.is_paused or not self.is_running:
+            return
         self.recover_count += 1
         logger.warning(
             f"[防卡死] 页面 {page} 无进展，执行第 {self.recover_count} 次恢复...")
@@ -695,6 +844,15 @@ class ScriptThread(QThread):
             return True
 
         price = _to_int(extract_and_merge_digits(self.ocr_region(price_region)))
+        if price is None:
+            # 详情面板按钮里的价格在刷新后有一小段渲染空窗（实机日志里约一半轮次读不到），
+            # 用列表第一张卡片的价格兜底：卡片价格刷新后先出现，且与详情面板是同一件商品
+            fallback_region = self.selector.get_region("price_fallback")
+            if fallback_region:
+                price = _to_int(extract_and_merge_digits(self.ocr_region(fallback_region)))
+                if price is not None and not self._price_fallback_warned:
+                    self._price_fallback_warned = True
+                    logger.info("[价格上限] 详情面板价格未读到，已改用列表第一张卡片价格兜底")
         if price is None:
             self.status_updated.emit("⚠️ 价格识别失败，本轮跳过购买")
             return False
@@ -964,17 +1122,17 @@ class ScriptThread(QThread):
 
         # 抢购窗口只有 1 秒，末尾每秒要轮询十几次，这里每多一次 OCR 就多几十~几百
         # 毫秒的识别延迟（CPU 上尤其明显），直接变成"比别人慢 0.x 秒"。
-        # 因此只做最必要的识别：先把倒计时读出来，其余判断全部推迟到"读不到倒计时"时再做
+        # 因此先做像素差分：画面没变就直接用缓存值；只有数字跳格时才 OCR，
+        # 其余判断全部推迟到"读不到倒计时"时再做（细节见 CountdownWatcher）
         self.snipe_live = False
-        res = self.ocr_region(time_region, frame)
-        if "天" in res or "小时" in res:
+        kind, total_seconds = self.countdown.update(
+            frame, time_region, lambda: self.ocr_region(time_region, frame))
+        if kind == "long":
             click_region_center(refresh_region)
             self.mark_progress()
             time.sleep(cfg['ocr_interval'])
             return "continue"
-
-        match = COUNTDOWN_PATTERN.search(res)
-        if not match:
+        if kind == "unknown":
             # 读不到倒计时，才需要花时间判断页面状态
             # 关注列表清空 → 本轮抢购结束（列表空了自然也就没有倒计时可读）
             joined, _total = read_follow_count(self, self.selector, frame)
@@ -996,9 +1154,7 @@ class ScriptThread(QThread):
 
         # 读到倒计时说明确实在关注页上：给 run() 一个信号，下一轮可以跳过页面识别
         self.snipe_live = True
-        minutes = int(match.group(1))
-        seconds = int(match.group(2))
-        total_seconds = minutes * 60 + seconds
+        minutes, seconds = divmod(total_seconds, 60)
         # 更新时间显示
         self.timer_updated.emit(str(minutes), str(seconds))
 
@@ -1012,8 +1168,9 @@ class ScriptThread(QThread):
             self.mark_progress()
         self.last_total = total_seconds
 
-        # 剩余指定秒数时点击刷新（每轮仅触发一次）
-        if (total_seconds == REFRESH_TRIGGER_SECONDS
+        # 剩余指定秒数时点击刷新（每轮仅触发一次）。
+        # 用 <= 兜底：OCR 误读或本地递减都可能整格跳过"5 秒"，严格相等会整轮不刷新
+        if (total_seconds <= REFRESH_TRIGGER_SECONDS
                 and cfg['click_refresh_enabled'] and not self.refreshed):
             self.status_updated.emit(f"🔄 剩余{total_seconds}秒，点击刷新...")
             click_region_center(refresh_region)
@@ -1050,12 +1207,18 @@ class ScriptThread(QThread):
                 self.status_updated.emit(
                     f"⚠️ 未检测到扣款（连续失败: {self.consecutive_fail_count}/{MAX_FAIL_COUNT}）"
                 )
-                # 连续失败达到阈值 → 判定卡死，执行恢复
+                # 连续失败达到阈值 → 只提示，不做任何界面操作。
+                # 市场改成"随机抽选购买资格"后，连点几十轮都没中签是正常现象；
+                # 以前这里当成界面卡死、按 ESC 恢复，反而把关注页/上一页打乱
+                # （实测日志 19:10:40：连续 10 次未扣款后立刻触发 [防卡死] 恢复）
                 if self.consecutive_fail_count >= MAX_FAIL_COUNT:
-                    logger.warning(f"[防卡死] 连续失败 {MAX_FAIL_COUNT} 次，判定为卡死，执行恢复...")
-                    self._recover_ui(PAGE_FOLLOW, frame)
+                    logger.warning(
+                        f"[抢购] 连续 {MAX_FAIL_COUNT} 轮未中签"
+                        "（随机抽选机制下属正常现象），继续等待下一轮，不改动页面")
+                    self.status_updated.emit(
+                        f"ℹ️ 已连续 {MAX_FAIL_COUNT} 轮未中签，继续等待"
+                        "（随机抽选机制下属正常现象）")
                     self.consecutive_fail_count = 0
-                    time.sleep(1)
 
             # 购买流程本身也算"有进展"，重置卡死计时避免误判
             self.mark_progress()
@@ -1068,9 +1231,15 @@ class ScriptThread(QThread):
     
     def pause(self):
         self.is_paused = True
+        # 暂停期间不会产生任何"进展"，卡死计时必须一起停：否则暂停半小时后一按继续，
+        # 看门狗会立刻按"长时间无进展"执行恢复（实测日志 18:55:46、21:50:14 都是
+        # 暂停结束的同一秒触发恢复）
+        self._reset_stall_timer()
     
     def resume(self):
         self.is_paused = False
+        # 同上：恢复后重新开始计时，给脚本完整一轮阈值的时间去重新识别页面
+        self._reset_stall_timer()
     
     def stop(self):
         self.is_running = False

@@ -94,8 +94,11 @@ GRID_ROWS = 3                     # 商品卡片网格可见行数
 # 价格在卡片内的相对位置（右下角）
 PRICE_RECT_RATIO = (0.86, 0.78, 1.00, 0.99)
 # 滚动后卡片与固定网格会错位（滚轮步长不是卡片行高的整数倍），价格会偏离上面
-# 标定的位置导致读不到。这时用更大的纵向范围重读一次：覆盖卡片 30%~100% 的高度
-PRICE_RECT_RATIO_WIDE = (0.86, 0.30, 1.00, 1.00)
+# 标定的位置导致读不到。这时用更大的纵向范围重读一次：覆盖卡片 15%~100% 的高度。
+# 实测日志里滚动后整排卡片都读不到价格、错位最大 -156px，原来的 30% 下界仍然
+# 落在价格上方（价格被挤出采样区）；横向仍只取卡片最右侧 14%（商品名在左侧，
+# 扩到 15% 不会把名字里的数字读进来）
+PRICE_RECT_RATIO_WIDE = (0.86, 0.15, 1.00, 1.00)
 # 价格锚点在卡片内的相对纵向位置（取 PRICE_RECT_RATIO 纵向范围的中心）。
 # 价格相对卡片的位置是固定的，因此可用"价格实际所在的 y"反推卡片中心，
 # 保证读到的价格和点下去的卡片是同一张（错位时也不会张冠李戴）
@@ -974,23 +977,34 @@ class MarketFlow:
         先按标定好的位置读（区域小、最快最准）；读不到说明滚动后卡片和固定网格
         错位了，价格不在标定位置上，再用纵向加大的范围重读一次。
 
+        两条路径都**逐个文字框**比较，取位数最多的那个，而不是把所有数字拼起来：
+        实测日志里 230 会被截成「2」「23」（OCR 漏字），拼接多个框又会把别的数字
+        混进来。位数更多的结果更接近真实价格（230 比 2 可信）。
+
         Returns:
             (价格, 价格中心的纵向坐标)；识别不到返回 (None, None)
         """
+        best = None
         for ratio in (PRICE_RECT_RATIO, PRICE_RECT_RATIO_WIDE):
             region = self._price_region(card, ratio)
             boxes = self.ops.ocr_region_boxes(region, frame)
-            digits = "".join(re.findall(r"\d", "".join(text for text, _ in boxes)))
-            if not digits:
-                continue
-            value = int(digits)
-            # 明显不合理的数字直接丢弃，避免误关注
-            if not 1 <= value <= 9_999_999:
-                continue
-            ys = [cy for text, (_, cy) in boxes if re.search(r"\d", text)]
-            price_y = sum(ys) / len(ys) if ys else (region[1] + region[3]) / 2
-            return value, price_y
-        return None, None
+            for text, (_, cy) in boxes:
+                digits = "".join(re.findall(r"\d", text))
+                if not digits:
+                    continue
+                value = int(digits)
+                # 明显不合理的数字直接丢弃，避免误关注
+                if not 1 <= value <= 9_999_999:
+                    continue
+                if best is None or len(digits) > len(best[0]):
+                    best = (digits, value, cy)
+            # 窄区域已经读到完整价格（3 位及以上）就不必再用大区域重读：
+            # 大区域容易把相邻卡片的价格也扫进来
+            if best is not None and len(best[0]) >= 3:
+                break
+        if best is None:
+            return None, None
+        return best[1], best[2]
 
     def _is_star_followed(self, frame):
         """通过星标区域的金色像素占比判断该商品是否已关注"""
