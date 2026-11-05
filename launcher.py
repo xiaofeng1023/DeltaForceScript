@@ -156,29 +156,31 @@ def copy_sources():
 def ensure_runtime():
     """首次运行解压便携 Python 与 pip，返回 python.exe 路径"""
     root = app_dir() / "runtime"
-    py = root / PY_DIR_NAME / "python.exe"
-    if py.exists():
-        return py
-
-    print("[env] 首次运行，正在解压内置的 Python 环境（只需一次）...")
-    zip_path = payload_dir() / PY_ZIP
-    if not zip_path.exists():
-        raise SystemExit(f"[error] 缺少 {PY_ZIP}，exe 打包不完整")
     py_dir = root / PY_DIR_NAME
-    py_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path) as zf:
-        zf.extractall(py_dir)
+    py = py_dir / "python.exe"
+    if not py.exists():
+        print("[env] 首次运行，正在解压内置的 Python 环境（只需一次）...")
+        zip_path = payload_dir() / PY_ZIP
+        if not zip_path.exists():
+            raise SystemExit(f"[error] 缺少 {PY_ZIP}，exe 打包不完整")
+        py_dir.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(zip_path) as zf:
+            zf.extractall(py_dir)
 
-    site = py_dir / "Lib" / "site-packages"
-    site.mkdir(parents=True, exist_ok=True)
-    # embeddable 版默认把 site-packages 关掉，这里改成显式放开
+        site = py_dir / "Lib" / "site-packages"
+        site.mkdir(parents=True, exist_ok=True)
+        boot = payload_dir() / "bootstrap"
+        if boot.exists():
+            shutil.copytree(boot, site, dirs_exist_ok=True)
+        print(f"[env] Python 环境就绪: {py}")
+
+    # 每次都校准 ._pth，不要只在首次写：
+    # 1) embeddable 版默认把 site-packages 关掉，必须显式放开；
+    # 2) 存在 ._pth 时 Python 进入 isolated 模式，**脚本所在目录不会自动进 sys.path**，
+    #    所以要把 exe 目录（相对 runtime\python 是 ..\..）写进去，
+    #    否则 main_gui.py 里 import window_capture 之类的同目录模块会报 ModuleNotFoundError
     (py_dir / PTH_NAME).write_text(
-        "python311.zip\n.\nLib\\site-packages\nimport site\n", encoding="ascii")
-
-    boot = payload_dir() / "bootstrap"
-    if boot.exists():
-        shutil.copytree(boot, site, dirs_exist_ok=True)
-    print(f"[env] Python 环境就绪: {py}")
+        "python311.zip\n.\nLib\\site-packages\n..\\..\nimport site\n", encoding="ascii")
     return py
 
 
