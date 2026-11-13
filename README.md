@@ -182,26 +182,6 @@ python region_selector.py season_options --delay 8
 
 `--delay N` 表示按下回车后等待 N 秒再截屏，这段时间用来切回游戏并点开要框选的控件。
 
-## TODO
-
-- [ ] 改用uv来管理依赖
-- [ ] 这段时间有点忙，等12月底看看能不能优化一下性能，试试能不能靠网络抓包来搞（可能不太好搞，就怕他加密）
-
-## 常见问题与故障排查
-
-1. OCR 识别不准确或无识别结果：
-   - 检查 `time` 区域是否正确截取（不要包含过多背景）
-   - 提高 OCR 识别对比度（可在 `region_selector` 保存截图后手动检查）
-   - 增大 `ocr_interval` 或调整识别模型
-
-2. 点击不准确或失败：
-   - 确认 `buy` 和 `verify` 区域坐标是否正确
-   - 尝试以管理员权限运行（脚本会自动尝试请求管理员权限）
-   - 调整 `buy_click_delay` 与 `buy_to_verify_delay`，应对界面响应延迟
-
-3. GPU/模型问题：
-   - 若使用 GPU，确保 `paddlepaddle-gpu` 与 CUDA 驱动匹配
-   - 若无法加载模型，可尝试使用 CPU 版本 `paddlepaddle`（速度较慢）
 
 
 ## 安全与免责声明
@@ -210,8 +190,3 @@ python region_selector.py season_options --delay 8
 - 使用脚本可能违反部分平台的使用协议，请自行承担风险。
 
 
-## 开发与贡献
-
-欢迎提交 issue 或 PR：
-- 改进 OCR 容错、区域选择体验
-- 增加更多点击策略（随机偏移、重试逻辑等）
