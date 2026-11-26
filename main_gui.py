@@ -7,11 +7,13 @@
 import os
 import sys
 import re
+import json
 import time
 import random
 
 import numpy as np
 import ctypes
+from ctypes import wintypes
 import logging
 # 设置 PaddleOCR 模型下载国内镜像（加速下载）
 os.environ['PADDLEX_MODEL_URL_PREFIX'] = 'https://paddlepaddle.bj.bcebos.com'
@@ -46,8 +48,8 @@ from window_capture import WindowCapture
 from region_selector import RegionSelector
 from gui_monitor import MonitorWindow
 from page_flow import (
-    ACTION_WAIT,
-    MarketFlow, detect_page, press_esc, read_follow_count,
+    ACTION_WAIT, FOLLOW_COUNT_PATTERN,
+    MarketFlow, detect_page, get_region, press_esc, read_follow_count,
     PAGE_BROWSE, PAGE_FILTER_DIALOG, PAGE_SALE, PAGE_GRADE_PANEL,
     PAGE_FOLLOW, PAGE_LOBBY, PAGE_MARKET, PAGE_UNKNOWN,
     PHASE_PREPARE, PHASE_SNIPE,
@@ -68,10 +70,20 @@ import pydirectinput
 pydirectinput.PAUSE = 0
 
 # ========== 全局常量 ==========
-# 末尾几秒的高频轮询间隔（秒），保证不错过 3 秒刷新与 1 秒购买窗口
-FAST_POLL_INTERVAL = 0.02
+# 末尾几秒（t <= 5s）的极速帧轮询间隔（秒），配合 timeBeginPeriod(1) 实现 ~3-4ms 级响应
+FAST_POLL_INTERVAL = 0.004
+# 中段临近期（5s < t <= 12s）轮询间隔（秒），确保精准卡住 5s 刷新点而不滞后
+MEDIUM_POLL_INTERVAL = 0.08
+# 准备阶段无页面跳转时的快速步进间隔（秒）
+PREPARE_FAST_INTERVAL = 0.04
 # 点击位置随机偏移范围（像素），避免每次点击坐标完全一致
-CLICK_JITTER_PX = 5
+CLICK_JITTER_PX = 4
+# 原生点击按下保持时长（秒）：约半帧~1帧，防止 Unreal Engine Slate UI 同帧吞掉 0ms 点击
+CLICK_HOLD_SECONDS = 0.008
+# 视觉闭环检测：确认弹窗区域像素变化占比超过该阈值判定为「弹窗已弹出」
+VERIFY_POPUP_OPEN_RATIO = 0.14
+# 视觉闭环检测：确认弹窗区域相对初始背景差异回落到该阈值以内判定为「弹窗已关闭」
+VERIFY_POPUP_CLOSED_RATIO = 0.08
 # 防卡死：倒计时持续多少秒没有任何变化（含 OCR 完全读不到倒计时）即判定为界面卡死
 # 正常倒计时每秒都在变，因此不会误触发；只有页面真的卡住（如被弹窗遮挡）才会恢复
 SELF_HEAL_STALL_SECONDS = 5
@@ -79,84 +91,147 @@ SELF_HEAL_STALL_SECONDS = 5
 SELF_HEAL_WARN_SECONDS = 5
 # "获得外观"结果页"跳过"按钮所在扫描区域（默认值取自 2K 屏的 2100,1140 - 2560,1320）
 SKIP_BUTTON_RECT_RATIO = (2100 / 2560, 1140 / 1440, 2560 / 2560, 1320 / 1440)
-# 脚本窗口的落点（相对主屏）。窗口是置顶的，会和游戏画面叠加，落点必须避开所有
-# 已标定区域。2560x1440 上不存在"350x780 且零重叠、按钮又都在屏内"的位置，
-# 取舍后选"贴屏幕右侧、纵向居中"：左上角 (2300, 375)、宽度 350。
-# 注意：setGeometry 里的 780 只是建议值，Qt 会按各控件的 minimumSizeHint 把窗口
-# 撑得更高。在 2560x1440 上实测实际高度 784px（对应 gui_monitor.py 里主布局
-# setSpacing(3)/setContentsMargins(3,3,3,3) 与日志框 setMinimumHeight(26) 这两处压缩），
-# 底边 y=375+784=1159，因此与 skip 区域的重叠是 y1140~1159 这 19px。
-# 该处是文字外的留白，不影响「跳过」二字的识别；关键区域 browse_anchor（y245~375）完整避开。
-# 若后续再往界面加控件，务必复测此高度，否则窗口底边会进一步压住「跳过」按钮。
-# 代价是窗口右侧约 90px 溢出屏幕外，溢出的正好是最右的"👁 预览"按钮，
-# "▶ 开始 / ⏸ 暂停 / ⏹ 停止"仍完整可见，不影响启停操作。
-# 特别是不能放在左下角：那里有 follow_count（我的关注：N/150），
-# 它是判断"我的关注"页的唯一依据，被压住会导致抢购阶段永远进不去
+# 脚本窗口的落点（相对主屏）
 WINDOW_LEFT_RATIO = 2300 / 2560
 WINDOW_TOP_RATIO = 375 / 1440
 # 倒计时剩余多少秒时点击刷新（修改后需同步 gui_monitor.py 中复选框的文案）
 REFRESH_TRIGGER_SECONDS = 5
-# 连续多少轮"未检测到扣款"就提示一次。市场按随机抽选发放购买资格，连续未中签是正常现象，
-# 因此这里只输出提示、不再触发任何界面恢复动作（旧逻辑会按 ESC，反而打乱关注页）
+# 连续多少轮"未检测到扣款"就提示一次
 MAX_FAIL_COUNT = 10
-# 购买+确认点完、按返回键回到关注列表后，等余额刷新再识别三角币的时间（秒）
-POST_BUY_SETTLE_SECONDS = 1.0
-# 退出「我的关注」页时，按 ESC 后等页面切换完成再重新识别的时间（秒）。
-# 实测游戏里由关注页切回上一页要 1~2 秒，若不等就重新识别，会把切换中的画面
-# 继续判成关注页，陷入"关注列表空 → ESC → 仍判为关注页 → 又进抢购"的死循环
-FOLLOW_EXIT_WAIT_SECONDS = 1.5
+# 购买+确认点完后，首次读取余额前的短暂稳定等待与二次复核等待（秒）
+POST_BUY_INITIAL_WAIT = 0.18
+POST_BUY_SETTLE_SECONDS = 0.38
+# 退出「我的关注」页时，按 ESC 后等页面切换完成再重新识别的时间（秒）
+FOLLOW_EXIT_WAIT_SECONDS = 1.2
 # 一次退出关注页时最多补按几次 ESC（每次间隔 FOLLOW_EXIT_WAIT_SECONDS）
 FOLLOW_EXIT_ATTEMPTS = 3
 # 抢购阶段连续多少轮识别不出关注页内容，就判定为已不在关注页，尝试导航回去
 SNIPE_UNKNOWN_LIMIT = 3
-# 抢购阶段意外离开关注页后，最多连续尝试"导航回关注页"的轮数。
-# 抢购成功后弹出的「获得外观」结果页 + 紧跟的 ESC，很容易把画面带到列表页或在售页，
-# 以前这里直接退回准备阶段（等于把关注列表作废、重新筛选一遍）；现在先设法回关注页，
-# 只有连续这么多轮都回不去，才认输退回准备阶段
+# 抢购阶段意外离开关注页后，最多连续尝试"导航回关注页"的轮数
 SNIPE_RETURN_ROUNDS = 8
-# 「关注页排序」最多尝试的轮数。设置排序要 OCR + 点几下，放进倒计时热路径会拖慢抢购，
-# 所以进入关注页后最多试这么多轮；某一轮没搞定（比如下拉面板没展开出来）下一轮再试
+# 「关注页排序」最多尝试的轮数
 FOLLOW_SORT_TRY_LIMIT = 3
 # 准备阶段连续多少轮识别不出页面，就主动执行一次通用恢复（关弹窗 / 退回上一层）
-# 原来准备阶段遇到未识别页面只是空等，直到 25 秒后被看门狗兜住，期间什么也不做
 PREPARE_UNKNOWN_LIMIT = 10
-# 连续多少次自动恢复都没有让主循环重新出现进展，就停下并提示用户。
-# 恢复动作本身也可能无效（比如点到的坐标不对），若恢复完就重置卡死计时，
-# 会变成"恢复 → 计时被重置 → 再恢复"的无限空转（关注页空列表场景曾空转 41 分钟）
+# 连续多少次自动恢复都没有让主循环重新出现进展，就停下并提示用户
 RECOVER_ESCALATE_LIMIT = 5
-# 连续多少次截屏失败就告警一次。dxcam 在"本轮没有新帧"时会返回 None（属正常现象），
-# 但持续失败通常意味着游戏窗口被最小化或屏幕被锁定，此时必须让用户知道
-CAPTURE_FAIL_WARN_LIMIT = 10
-# 「仅关注页」模式下，关注列表抢空后原地等用户手动加关注时的轮询间隔（秒）。
-# 这段等待里每轮都要做页面识别（最多 7 次 OCR），间隔太短只是白烧 GPU
+# 超过多少秒完全抓不到任何桌面帧才告警（区分正常的静止画面无新帧与窗口最小化/锁屏）
+CAPTURE_STALE_WARN_SECONDS = 4.0
+# 「仅关注页」模式下，关注列表抢空后原地等用户手动加关注时的轮询间隔（秒）
 FOLLOW_WAIT_POLL_SECONDS = 1.5
-# 市场每日关闭时段（HH:MM）。关闭时段内市场不可交易，脚本会自行停止：
-# 跨夜挂机时到点立刻停，避免对着关着的市场空点；时段内启动则直接停。
-# 开市时间必须晚于关闭时间，否则视为不启用该功能（防止填错时间导致脚本永远起不来）
+# 市场每日关闭时段（HH:MM）
 MARKET_CLOSE_TIME = "05:00"
 MARKET_OPEN_TIME = "08:00"
 # 市场时段输入框接受的格式："05:00" / "5:00" / "0500"
 TIME_PATTERN = re.compile(r"^(\d{1,2}):?(\d{2})$")
 # 准备阶段（筛选 / 加关注）多少秒没有任何进展即判定为卡住
-# 准备阶段单步本身包含多次 OCR 与等待，耗时远大于抢购阶段，因此阈值放宽
 PREPARE_STALL_SECONDS = 25
-# 准备阶段的轮询间隔（秒）；各步骤内部已有点击等待，这里只需短暂让出
-PREPARE_POLL_INTERVAL = 0.3
+# 准备阶段的轮询间隔（秒）
+PREPARE_POLL_INTERVAL = 0.20
 # 本地 OCR 模型根目录（相对脚本所在目录）
 MODEL_ROOT = "models"
+# 用户界面参数持久化文件名
+USER_CONFIG_FILE = "user_config.json"
 # 倒计时文本："N分M秒"
 COUNTDOWN_PATTERN = re.compile(r'(\d+)\s*分\s*(\d+)\s*秒')
 
-# ========== 倒计时像素差分 ==========
-# 抢购热路径上每轮都要 OCR 一次倒计时（det+rec，GPU 约 40~90 ms，CPU 上 100~200 ms），
-# 而倒计时数字每秒才变一次 —— 画面没变时再识别一遍是纯浪费。
-# 改法：每轮只把倒计时区域缩成小图做像素差分（~0.3 ms），
-#   1. 画面没变        -> 缓存值继续有效，跳过 OCR（决策零延迟）
-#   2. 画面一秒一跳    -> 本地值 -1，不做 OCR（只有读数字时才需要 OCR）
-#   3. 整块画面都变了  -> 页面切换/弹窗/刷新出新轮，强制 OCR 重新取权威值
-#   4. 数值掉到 3 秒   -> OCR 校准一次，之后 2 秒、1 秒靠本地递减（购买决策不等 OCR）
-#   5. 超过 3 秒没识别 -> 定期校准一次，防止递减漂移
-#   6. 一秒内变好几次  -> 数字切换动画/意外抖动，连续几次后退回逐轮 OCR（行为同改前）
+# ========== 高精度时钟与原生 Win32 输入层 ==========
+INPUT_MOUSE = 0
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_ABSOLUTE = 0x8000
+
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", wintypes.LONG),
+        ("dy", wintypes.LONG),
+        ("mouseData", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.c_size_t),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("mi", _MOUSEINPUT)]
+
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", _INPUTUNION),
+    ]
+
+
+class _WindowsTimerResolution:
+    """将 Windows 系统定时器精度从默认 15.625ms 提升至 1ms"""
+
+    def __init__(self, period_ms: int = 1):
+        self.period_ms = period_ms
+        self._active = False
+
+    def __enter__(self):
+        try:
+            ctypes.windll.winmm.timeBeginPeriod(self.period_ms)
+            self._active = True
+        except Exception:
+            self._active = False
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._active:
+            try:
+                ctypes.windll.winmm.timeEndPeriod(self.period_ms)
+            except Exception:
+                pass
+            self._active = False
+
+
+def precise_sleep(seconds: float):
+    """亚毫秒级高精度等待（配合 timeBeginPeriod(1) 消除 Windows 默认 15.6ms 睡眠抖动）"""
+    if seconds <= 0:
+        return
+    deadline = time.perf_counter() + seconds
+    if seconds > 0.003:
+        time.sleep(seconds - 0.002)
+    while time.perf_counter() < deadline:
+        time.sleep(0)
+
+
+def _send_mouse_event(flags: int, dx: int = 0, dy: int = 0) -> int:
+    inp = _INPUT(
+        type=INPUT_MOUSE,
+        union=_INPUTUNION(mi=_MOUSEINPUT(dx=dx, dy=dy, mouseData=0, dwFlags=flags, time=0, dwExtraInfo=0)),
+    )
+    return ctypes.windll.user32.SendInput(1, ctypes.byref(inp), ctypes.sizeof(inp))
+
+
+def fast_move(x: int, y: int):
+    """原生 Win32 SendInput 鼠标绝对定位（零多余查询开销）"""
+    user32 = ctypes.windll.user32
+    sw = max(2, user32.GetSystemMetrics(0))
+    sh = max(2, user32.GetSystemMetrics(1))
+    nx = int(round(x * 65535 / (sw - 1)))
+    ny = int(round(y * 65535 / (sh - 1)))
+    if _send_mouse_event(MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE, nx, ny) == 0:
+        pydirectinput.moveTo(int(x), int(y))
+
+
+def fast_click(x: int, y: int, hold: float = CLICK_HOLD_SECONDS, move: bool = True):
+    """原生 Win32 极速左键点击，带微秒/帧级按压保持以防 UE4/UE5 同帧漏检"""
+    if move:
+        fast_move(x, y)
+    down_ok = _send_mouse_event(MOUSEEVENTF_LEFTDOWN)
+    if hold > 0:
+        precise_sleep(hold)
+    up_ok = _send_mouse_event(MOUSEEVENTF_LEFTUP)
+    if down_ok == 0 or up_ok == 0:
+        pydirectinput.click(x=int(x), y=int(y), button=pydirectinput.LEFT)
+
+
+# ========== 倒计时像素差分与亚秒级跳秒相位锁定 ==========
 COUNTDOWN_SIG_SIZE = (128, 48)      # 差分用的小图尺寸：够分辨数字，又足够快
 COUNTDOWN_PIXEL_DELTA = 18          # 单像素灰度差超过它才算"这个点变了"
 COUNTDOWN_CHANGED_RATIO = 0.005     # 变化像素占比 ≥0.5% 才认为数字变了（抗区域大小差异）
@@ -164,27 +239,28 @@ COUNTDOWN_BIG_RATIO = 0.25          # 变化像素占比 ≥25% 视为整块画�
 COUNTDOWN_CHANGE_MIN_GAP = 0.35     # 倒计时不可能比这更快地跳一格
 COUNTDOWN_CONFIRM_AT = 3            # 数值到 3 秒时 OCR 校准一次
 COUNTDOWN_RESYNC_SECONDS = 3.0      # 这么久没 OCR 过就校准一次（只对剩余 10 秒内生效）
-# 最后 3 秒（购买决策区间）校准更勤一些：万一画面卡住不动，也不会拿旧值连着点
-COUNTDOWN_RESYNC_FAST_SECONDS = 1.5
+COUNTDOWN_RESYNC_FAST_SECONDS = 1.4
 COUNTDOWN_UNSTABLE_LIMIT = 3        # 连续这么多次"跳太快"就退回纯 OCR
 
 
 class CountdownWatcher:
-    """用像素差分代替"每轮 OCR"来跟踪倒计时
+    """用像素差分 + 跳秒相位锁定来跟踪倒计时
 
     update() 返回 (kind, total_seconds):
-        ("value", n)     剩余 n 秒（OCR 权威值，或按跳秒本地递减得到）
+        ("value", n)     剩余 n 秒（OCR 权威值，或按跳秒本地递减得到；含归零瞬间 n=0）
         ("long", None)   倒计时按"天/小时"显示（市场还没开）
         ("unknown", None) 区域里没有可识别的倒计时（可能已不在关注页）
     """
 
     def __init__(self):
-        self.auto = True          # False = 差分不可靠，退回逐轮 OCR
-        self._sig = None          # 上一次 OCR 时的画面签名
-        self._value = None        # 上一次 OCR 得到的剩余秒数
+        self.auto = True
+        self._sig = None
+        self._value = None
         self._last_change_at = 0.0
         self._last_ocr_at = 0.0
         self._fast_hits = 0
+        self.last_tick_perf = None      # 最近一次整数秒跳变发生的精确 perf_counter 时间戳
+        self._refresh_sync_after = 0.0  # 点击刷新后的强制权威 OCR 同步时刻
 
     def reset(self):
         """页面可能已切换：丢掉签名与缓存值，下一轮重新 OCR"""
@@ -192,13 +268,40 @@ class CountdownWatcher:
         self._value = None
         self._last_change_at = 0.0
         self._fast_hits = 0
-        # 重新给差分一次机会。以前 auto=False 是"一降级就永久逐轮 OCR"：实测
-        # 11:28~11:30 连续降级 4 次后，整晚都在逐轮 OCR，像素差分优化实际没生效
+        self.last_tick_perf = None
+        self._refresh_sync_after = 0.0
         self.auto = True
+
+    def mark_refreshed(self, settle_seconds: float = 0.22):
+        """通知观察器刚刚点击了刷新按钮：等列表回包稳定后强制走一次权威 OCR
+
+        解决刷新后榜首切换为另一件剩余秒数不同的商品时，像素差分误把新商品秒数
+        当作旧商品 -1 秒递减的问题。
+        """
+        self._refresh_sync_after = time.perf_counter() + settle_seconds
+        self._fast_hits = 0
 
     def value(self):
         """最近一次确认的剩余秒数（None 表示还不知道）"""
         return self._value
+
+    def tick_age(self):
+        """距离最近一次跳秒过去了多少秒；未知返回 None"""
+        if self.last_tick_perf is None:
+            return None
+        return time.perf_counter() - self.last_tick_perf
+
+    def resync_due(self) -> bool:
+        """当前时刻是否需要即使无新帧也触发校准"""
+        now_perf = time.perf_counter()
+        if self._refresh_sync_after > 0 and now_perf >= self._refresh_sync_after:
+            return True
+        if self._value is not None and self._value <= 10:
+            resync = (COUNTDOWN_RESYNC_FAST_SECONDS if self._value <= 3
+                      else COUNTDOWN_RESYNC_SECONDS)
+            if time.time() - self._last_ocr_at > resync:
+                return True
+        return False
 
     @staticmethod
     def signature(frame, region):
@@ -224,6 +327,17 @@ class CountdownWatcher:
     def update(self, frame, region, read):
         """根据当前画面返回倒计时状态；read 是一个"做一次 OCR 并返回文本"的回调"""
         sig = self.signature(frame, region)
+        now_perf = time.perf_counter()
+
+        # 刷新后等待回包期：稳定前暂维持旧值避免误判，到点后立即强制权威 OCR 同步新商品
+        if self._refresh_sync_after > 0:
+            if now_perf < self._refresh_sync_after:
+                if self._value is not None:
+                    return ("value", self._value)
+            else:
+                self._refresh_sync_after = 0.0
+                return self._read(read, sig, record_tick=False)
+
         if not self.auto:
             return self._read(read, sig)
         if sig is None:
@@ -234,21 +348,26 @@ class CountdownWatcher:
         ratio = self._changed_ratio(sig, self._sig)
         now = time.time()
         if ratio < COUNTDOWN_CHANGED_RATIO:
-            # 画面没变 -> 显示的仍是缓存那个数；只在剩余时间不大时定期校准
             resync = (COUNTDOWN_RESYNC_FAST_SECONDS if self._value <= 3
                       else COUNTDOWN_RESYNC_SECONDS)
             if self._value <= 10 and now - self._last_ocr_at > resync:
                 return self._read(read, sig)
             return ("value", self._value)
         if ratio >= COUNTDOWN_BIG_RATIO:
-            # 整块画面换了（切页面/弹窗/刷新出新轮）：缓存值不可信
+            # 整块画面换了（切页面/弹窗/倒计时归零消失）：
+            # 若上一刻正是 1 秒且已持续 >0.25s，倒计时文字消失往往意味着刚刚归零解锁！
+            prev_val = self._value
+            prev_change = self._last_change_at
             self._last_change_at = now
-            return self._read(read, sig)
+            res = self._read(read, sig, record_tick=True)
+            if res[0] == "unknown" and prev_val == 1 and (now - prev_change) >= 0.25:
+                self.last_tick_perf = now_perf
+                return ("value", 0)
+            return res
 
         gap = now - self._last_change_at
         self._last_change_at = now
         if gap < COUNTDOWN_CHANGE_MIN_GAP:
-            # 比"一秒一跳"快得多：数字切换动画或画面抖动，用 OCR 兜底
             self._fast_hits += 1
             if self._fast_hits >= COUNTDOWN_UNSTABLE_LIMIT:
                 self.auto = False
@@ -257,16 +376,17 @@ class CountdownWatcher:
         self._fast_hits = 0
 
         nxt = self._value - 1
+        self.last_tick_perf = now_perf
         if nxt < 0 or nxt == COUNTDOWN_CONFIRM_AT:
-            # 归零/刷新后跳回大数值/到 3 秒：用 OCR 拿权威值
-            return self._read(read, sig)
-        # 正常跳秒：本地递减，购买决策走这条路径，不需要等 OCR
+            return self._read(read, sig, record_tick=True)
+        # 正常跳秒：本地递减（含 1->0 归零瞬间），零 OCR 延迟立即决策
         self._value = nxt
         self._sig = sig
         return ("value", nxt)
 
-    def _read(self, read, sig):
+    def _read(self, read, sig, record_tick: bool = False):
         """做一次 OCR 并更新缓存；读不到就清空状态交由调用方兜底"""
+        prev_val = self._value
         text = read() or ""
         self._last_ocr_at = time.time()
         if "天" in text or "小时" in text:
@@ -278,6 +398,8 @@ class CountdownWatcher:
             self.reset()
             return ("unknown", None)
         total = int(match.group(1)) * 60 + int(match.group(2))
+        if record_tick or (prev_val is not None and total == prev_val - 1):
+            self.last_tick_perf = time.perf_counter()
         self._value = total
         self._sig = sig
         return ("value", total)
@@ -371,36 +493,24 @@ def _market_closed(now, close_text, open_text):
     return close_minute <= now_minute < open_minute
 
 
-def click_region_center(region: tuple, clicks=1, interval=0.1):
-    """点击区域的中心位置
-
-    Args:
-        region: (left, top, right, bottom) 格式的区域坐标
-        clicks: 点击次数
-        interval: 多次点击之间的间隔（秒）
-    """
+def click_region_center(region: tuple, clicks=1, interval=0.05, hold=CLICK_HOLD_SECONDS):
+    """点击区域的中心位置（原生 Win32 极速实现）"""
     left, top, right, bottom = region
-    center_x = (left + right) // 2
-    center_y = (top + bottom) // 2
-
-    # 在 ±CLICK_JITTER_PX 像素范围内随机偏移，避免固定坐标被检测
-    center_x += random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
-    center_y += random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
-
-    pydirectinput.click(x=center_x, y=center_y, clicks=clicks, interval=interval, button=pydirectinput.LEFT)
+    center_x = (left + right) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+    center_y = (top + bottom) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+    for i in range(clicks):
+        fast_click(center_x, center_y, hold=hold, move=(i == 0))
+        if i < clicks - 1 and interval > 0:
+            precise_sleep(interval)
 
 
-def click_point(point: tuple):
-    """在指定像素点附近随机抖动后点击
-
-    Args:
-        point: (x, y) 屏幕坐标
-    """
+def click_point(point: tuple, hold=CLICK_HOLD_SECONDS):
+    """在指定像素点附近随机抖动后点击"""
     x, y = point
-    pydirectinput.click(
-        x=x + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX),
-        y=y + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX),
-        button=pydirectinput.LEFT,
+    fast_click(
+        x + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX),
+        y + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX),
+        hold=hold,
     )
 
 
@@ -460,12 +570,20 @@ def create_ocr(base_dir: str):
     except Exception as e:
         logger.warning(f"GPU 初始化失败，回退到 CPU: {e}")
         ocr = PaddleOCR(device='cpu', **kwargs)
-    # PaddleOCR 初始化时会把根 logger 的级别调高（实测此后 INFO 全部被丢弃，
-    # logs\*.log 里只剩 WARNING/ERROR，界面上看到的每一步状态都写不进文件）。
-    # 这里在 OCR 就绪后把级别恢复成 INFO，保证运行过程可追溯
+    # PaddleOCR 初始化时会把根 logger 的级别调高，恢复为 INFO 保证运行过程可追溯
     logging.getLogger().setLevel(logging.INFO)
     for _handler in logging.getLogger().handlers:
         _handler.setLevel(logging.INFO)
+
+    # 启动时预热一次推理图（编译 CUDA Kernel / CPU 算子缓存），避免首次倒计时识别出现百毫秒冷启动卡顿
+    try:
+        warmup = np.zeros((48, 160, 3), dtype=np.uint8)
+        cv2.putText(warmup, "0:05", (16, 34), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 255), 2)
+        ocr.predict(warmup)
+        logger.info("OCR 推理引擎预热完成")
+    except Exception as e:
+        logger.debug(f"OCR 预热跳过: {e}")
+
     return ocr
 
 
@@ -516,31 +634,55 @@ class ScriptThread(QThread):
         self.last_money_check = ""       # 上一次的三角币数量
         self.unknown_rounds = 0          # 抢购阶段连续识别不出页面的轮数
         self.return_follow_rounds = 0    # 抢购阶段连续尝试导航回关注页的轮数
-        self.follow_sort_tries = 0        # 本次进入关注页已尝试设置排序的轮数
+        self.follow_sort_tries = 0       # 本次进入关注页已尝试设置排序的轮数
+        self.snipe_checked_once = False  # 本次进入关注页是否已至少跑过一轮倒计时读取
         self.snipe_live = False          # 上一轮是否读到过倒计时（用于跳过重复的页面识别）
-        self.countdown = CountdownWatcher()  # 倒计时像素差分：大多数轮次不再 OCR
+        self.prechecked_price = None     # 提前预审的价格缓存: (是否允许购买, 价格数值)
+        self.buy_hovered = False         # 本轮是否已提前将光标预悬停至购买按钮
+        self.hover_buy_pt = None         # 预悬停的购买按钮坐标
+        self.countdown = CountdownWatcher()  # 倒计时像素差分与相位锁定
         self.prepare_unknown_rounds = 0  # 准备阶段连续识别不出页面的轮数
         self.recover_count = 0           # 连续自动恢复的次数（真正有进展时清零）
-        self.capture_fail_count = 0      # 连续截屏失败的次数
+        self._capture_stale_warned = False
 
     # ------------------------------------------------------------ ops 接口
-    def capture(self):
-        """截取整屏画面
+    def capture_fresh(self):
+        """抓取全新桌面帧（无新帧时返回 (cached_frame, False)，供热路径零拷贝跳帧）"""
+        frame, is_new = self.win_cap.capture_fresh()
+        if is_new:
+            self._capture_stale_warned = False
+            return frame, True
+        age = self.win_cap.last_frame_age()
+        if age > CAPTURE_STALE_WARN_SECONDS and not self._capture_stale_warned:
+            self._capture_stale_warned = True
+            logger.warning("[截屏] 已超过 %.1f 秒未捕获到新画面，尝试重连捕获器", age)
+            self.win_cap.reconnect()
+            frame, is_new = self.win_cap.capture_fresh()
+            if is_new:
+                self._capture_stale_warned = False
+                return frame, True
+            self.status_updated.emit(
+                "⚠️ 长时间未捕获到游戏画面，请确认游戏窗口未最小化、屏幕未被锁定")
+        return frame, False
 
-        dxcam 在"本轮没有新帧"时会返回 None（属正常现象），但持续失败通常意味着
-        游戏窗口被最小化或屏幕被锁定。这里累计到阈值后告警一次，避免脚本静默空转。
-        """
-        frame = self.win_cap.capture()
-        if frame is None or frame.size == 0:
-            self.capture_fail_count += 1
-            if self.capture_fail_count == CAPTURE_FAIL_WARN_LIMIT:
-                logger.warning("[截屏] 连续 %d 次截屏失败", CAPTURE_FAIL_WARN_LIMIT)
-                self.status_updated.emit(
-                    f"⚠️ 连续 {CAPTURE_FAIL_WARN_LIMIT} 次截屏失败，"
-                    "请确认游戏窗口未最小化、屏幕未被锁定")
-            return None
-        self.capture_fail_count = 0
-        return frame
+    def capture(self, max_cache_age: float = 1.2):
+        """截取整屏画面（桌面静止无新帧时自动复用近期缓存帧，避免瞬时返回 None）"""
+        frame = self.win_cap.capture(max_cache_age=max_cache_age)
+        if frame is not None and frame.size > 0:
+            self._capture_stale_warned = False
+            return frame
+        age = self.win_cap.last_frame_age()
+        if age > CAPTURE_STALE_WARN_SECONDS and not self._capture_stale_warned:
+            self._capture_stale_warned = True
+            logger.warning("[截屏] 连续 %.1f 秒截屏为空，尝试重连 DXGI", age)
+            self.win_cap.reconnect()
+            frame = self.win_cap.capture(max_cache_age=max_cache_age)
+            if frame is not None and frame.size > 0:
+                self._capture_stale_warned = False
+                return frame
+            self.status_updated.emit(
+                "⚠️ 截屏持续为空，请确认游戏窗口未最小化、屏幕未被锁定")
+        return None
 
     def click_region(self, region):
         """点击区域中心"""
@@ -580,7 +722,11 @@ class ScriptThread(QThread):
         self.unknown_rounds = 0
         self.return_follow_rounds = 0
         self.follow_sort_tries = 0
+        self.snipe_checked_once = False
         self.snipe_live = False
+        self.prechecked_price = None
+        self.buy_hovered = False
+        self.hover_buy_pt = None
         self.countdown.reset()
         self.follow_wait_notified = False
         self.stall_warned = False
@@ -644,6 +790,7 @@ class ScriptThread(QThread):
         # 回到关注页等于重新进了这一页，排序可能会被游戏重置为「默认排序」，
         # 所以下一轮允许再检查一次（见 run() 里的 follow_sort_tries）
         self.follow_sort_tries = 0
+        self.snipe_checked_once = False
         if page == PAGE_BROWSE:
             self.status_updated.emit("↩️ 抢购阶段离开关注页，点「我的关注」入口返回")
             self.flow.enter_follow_page(frame)
@@ -673,22 +820,45 @@ class ScriptThread(QThread):
             self._leave_snipe()
     
     def frame_cut(self, frame, region):
-        """裁剪图像区域"""
+        """裁剪图像区域（自动做边界保护）"""
+        h, w = frame.shape[:2]
         left, top, right, bottom = region
-        return frame[top:bottom, left:right]
+        cl, ct = max(0, int(left)), max(0, int(top))
+        cr, cb = min(w, int(right)), min(h, int(bottom))
+        return frame[ct:cb, cl:cr]
+
+    @staticmethod
+    def _prepare_ocr_roi(frame, region):
+        """裁剪小区域并补充边缘留白，防止紧贴边界的数字（如 230、0分1秒）被 DBNet 截断
+
+        Returns:
+            (padded_roi, origin_x, origin_y)；若区域无效返回 (None, 0, 0)
+        """
+        h, w = frame.shape[:2]
+        left, top, right, bottom = (int(v) for v in region)
+        cl, ct = max(0, left), max(0, top)
+        cr, cb = min(w, right), min(h, bottom)
+        if cr <= cl or cb <= ct:
+            return None, 0, 0
+        roi = frame[ct:cb, cl:cr]
+        rh, rw = roi.shape[:2]
+        if rh < 90 or rw < 300:
+            pad = 10
+            roi = cv2.copyMakeBorder(roi, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+            return roi, cl - pad, ct - pad
+        return roi, cl, ct
 
     def ocr_region(self, region, frame=None):
-        """对指定区域做 OCR 识别，返回识别到的第一段文本
-
-        Args:
-            region: (left, top, right, bottom) 区域坐标
-            frame: 已捕获的整屏画面；为 None 时自行截屏（同一轮内复用可少截一次）
-        """
+        """对指定区域做 OCR 识别，返回识别到的第一段文本"""
+        if not region:
+            return ""
         if frame is None:
             frame = self.capture()
         if frame is None or frame.size == 0:
             return ""
-        roi = self.frame_cut(frame, region)
+        roi, _, _ = self._prepare_ocr_roi(frame, region)
+        if roi is None or roi.size == 0:
+            return ""
         res = self.ocr.predict(roi)
         if not res or not res[0]:
             return ""
@@ -696,21 +866,20 @@ class ScriptThread(QThread):
             texts = res[0]['rec_texts']
         except (KeyError, TypeError, IndexError):
             return ""
-        return texts[0] if texts else ""
+        return "".join(texts) if len(texts) > 1 else (texts[0] if texts else "")
 
     def ocr_region_items(self, region, frame=None):
-        """对指定区域做 OCR，返回 [(文本, x1, y1, x2, y2), ...]（绝对坐标）
-
-        Args:
-            region: (left, top, right, bottom) 区域坐标
-            frame: 已捕获的整屏画面；为 None 时自行截屏
-        """
+        """对指定区域做 OCR，返回 [(文本, x1, y1, x2, y2), ...]（绝对坐标）"""
+        if not region:
+            return []
         if frame is None:
             frame = self.capture()
         if frame is None or frame.size == 0:
             return []
-        left, top, right, bottom = region
-        res = self.ocr.predict(frame[top:bottom, left:right])
+        roi, ox, oy = self._prepare_ocr_roi(frame, region)
+        if roi is None or roi.size == 0:
+            return []
+        res = self.ocr.predict(roi)
         if not res or not res[0]:
             return []
         try:
@@ -723,14 +892,106 @@ class ScriptThread(QThread):
             xs = [float(p[0]) for p in poly]
             ys = [float(p[1]) for p in poly]
             items.append((content,
-                          int(left + min(xs)), int(top + min(ys)),
-                          int(left + max(xs)), int(top + max(ys))))
+                          int(ox + min(xs)), int(oy + min(ys)),
+                          int(ox + max(xs)), int(oy + max(ys))))
         return items
 
     def ocr_region_boxes(self, region, frame=None):
         """对指定区域做 OCR，返回 [(文本, 文本框中心绝对坐标), ...]"""
         return [(text, ((x1 + x2) // 2, (y1 + y2) // 2))
                 for text, x1, y1, x2, y2 in self.ocr_region_items(region, frame)]
+
+    def ocr_regions_batch(self, named_regions, frame=None):
+        """将多个命名区域纵向拼接为单张画布，1 次 OCR 推理识别全部区域并映射回原屏绝对坐标
+
+        对超宽区域（>740px）自动做水平重叠切分纵向排布，保证画布最大边不超过检测器阈值，
+        避免整图被缩小导致小字号文本漏检。
+
+        Args:
+            named_regions: [(name, (left, top, right, bottom)), ...]
+            frame: 已捕获的整屏画面
+
+        Returns:
+            {name: [(text, x1, y1, x2, y2), ...]}
+        """
+        if frame is None:
+            frame = self.capture()
+        results = {name: [] for name, _ in named_regions}
+        if frame is None or frame.size == 0 or not named_regions:
+            return results
+
+        fh, fw = frame.shape[:2]
+        max_strip_w = 740
+        pad = 10
+        sep = 22
+        strips = []  # (name, padded_crop, y_start, y_end, origin_x, origin_y)
+        cur_y = 0
+        canvas_w = 0
+
+        for name, region in named_regions:
+            if not region:
+                continue
+            l, t, r, b = (int(v) for v in region)
+            cl, ct = max(0, l), max(0, t)
+            cr, cb = min(fw, r), min(fh, b)
+            if cr <= cl or cb <= ct:
+                continue
+            w = cr - cl
+            # 超宽条切分成左右重叠两段，防止画布过宽触发 DBNet 降采样
+            segments = []
+            if w <= max_strip_w:
+                segments.append((cl, ct, cr, cb))
+            else:
+                step = max_strip_w - 40
+                sx = cl
+                while sx < cr:
+                    ex = min(cr, sx + max_strip_w)
+                    segments.append((sx, ct, ex, cb))
+                    if ex >= cr:
+                        break
+                    sx += step
+
+            for sl, st, sr, sb in segments:
+                crop = frame[st:sb, sl:sr]
+                padded = cv2.copyMakeBorder(crop, pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+                ph, pw = padded.shape[:2]
+                y0, y1 = cur_y, cur_y + ph
+                strips.append((name, padded, y0, y1, sl - pad, st - pad))
+                canvas_w = max(canvas_w, pw)
+                cur_y = y1 + sep
+
+        if not strips:
+            return results
+
+        canvas_h = strips[-1][3]
+        canvas = np.full((canvas_h, canvas_w, 3), 24, dtype=np.uint8)
+        for _name, padded, y0, y1, _ox, _oy in strips:
+            canvas[y0:y1, :padded.shape[1]] = padded
+
+        res = self.ocr.predict(canvas)
+        if not res or not res[0]:
+            return results
+        try:
+            texts = res[0]['rec_texts']
+            polys = res[0]['rec_polys']
+        except (KeyError, TypeError, IndexError):
+            return results
+
+        for content, poly in zip(texts, polys):
+            xs = [float(p[0]) for p in poly]
+            ys = [float(p[1]) for p in poly]
+            cy = sum(ys) / len(ys)
+            for name, padded, y0, y1, ox, oy in strips:
+                if y0 <= cy <= y1 and min(xs) < padded.shape[1]:
+                    results[name].append((
+                        content,
+                        int(ox + min(xs)),
+                        int(oy + (min(ys) - y0)),
+                        int(ox + max(xs)),
+                        int(oy + (max(ys) - y0)),
+                    ))
+                    break
+        return results
 
     def _try_skip_result_page(self, frame):
         """识别"获得枪械外观"结果页并点击"跳过"
@@ -823,87 +1084,296 @@ class ScriptThread(QThread):
         self.status_updated.emit("[防卡死] 恢复完成，继续监控...")
         self._reset_stall_timer()
 
-    def _price_within_limit(self, cfg):
-        """购买前检查商品价格是否在上限内
+    def _evaluate_price_limit(self, cfg, frame=None, silent_pass=False):
+        """读取当前商品价格并校验是否不超过上限
 
-        价格为 OCR 识别结果，识别不到时按不购买处理（避免超价买入）。
-        price 区域未配置时不做拦截，保持原有的直接购买行为，并只告警一次。
+        支持在 t=2~4s 空闲窗口提前预审并缓存结果，使 t<=1s 抢购触发点实现 0 次 OCR、0ms 阻塞；
+        同时显式透传 frame，避免再次调用 grab() 遇到瞬时无新帧返回 None。
 
         Returns:
-            True 表示可以购买
+            (allowed: bool, price: Optional[int])；识别失败时返回 (False, None)
         """
         if cfg['follow_only']:
-            # 仅关注页模式：关注列表是用户自己一个个挑出来的，不再套价格上限
-            return True
+            return True, None
         price_region = self.selector.get_region("price")
         if not price_region:
             if not self._price_region_warned:
                 self._price_region_warned = True
                 logger.warning("[价格上限] 未配置 price 区域，价格上限暂不生效")
                 self.status_updated.emit("⚠️ 未配置价格区域，价格上限暂不生效")
-            return True
+            return True, None
 
-        price = _to_int(extract_and_merge_digits(self.ocr_region(price_region)))
-        if price is None:
-            # 详情面板按钮里的价格在刷新后有一小段渲染空窗（实机日志里约一半轮次读不到），
-            # 用列表第一张卡片的价格兜底：卡片价格刷新后先出现，且与详情面板是同一件商品
-            fallback_region = self.selector.get_region("price_fallback")
-            if fallback_region:
-                price = _to_int(extract_and_merge_digits(self.ocr_region(fallback_region)))
+        if frame is None:
+            frame = self.capture()
+        fallback_region = self.selector.get_region("price_fallback")
+
+        # 若同时配置了主价格区和兜底卡片价格区，单次批量 OCR 同时识别，省掉失败再重试的第二轮推理
+        if fallback_region and frame is not None and frame.size > 0:
+            batch = self.ocr_regions_batch(
+                [("primary", price_region), ("fallback", fallback_region)], frame
+            )
+            p_text = "".join(t for t, *_ in batch.get("primary", ()))
+            price = _to_int(extract_and_merge_digits(p_text))
+            if price is None:
+                fb_text = "".join(t for t, *_ in batch.get("fallback", ()))
+                price = _to_int(extract_and_merge_digits(fb_text))
                 if price is not None and not self._price_fallback_warned:
                     self._price_fallback_warned = True
                     logger.info("[价格上限] 详情面板价格未读到，已改用列表第一张卡片价格兜底")
-        if price is None:
-            self.status_updated.emit("⚠️ 价格识别失败，本轮跳过购买")
-            return False
-        if price > cfg['price_limit']:
-            self.status_updated.emit(f"⏭️ 价格 {price} 超过上限 {cfg['price_limit']}，跳过本轮")
-            return False
-        return True
+        else:
+            price = _to_int(extract_and_merge_digits(self.ocr_region(price_region, frame)))
 
-    def _buy_and_check(self, cfg, buy_region, verify_region, money_region, last_money_check):
-        """执行一轮购买+确认，按返回回到关注列表后对比三角币判断是否成功
+        if price is None:
+            if not silent_pass:
+                self.status_updated.emit("⚠️ 价格识别失败，本轮跳过购买")
+            return False, None
+        if price > cfg['price_limit']:
+            if not silent_pass:
+                self.status_updated.emit(f"⏭️ 价格 {price} 超过上限 {cfg['price_limit']}，跳过本轮")
+            return False, price
+        return True, price
+
+    def _price_within_limit(self, cfg, frame=None):
+        """购买前检查商品价格是否在上限内（优先读取预审缓存）"""
+        if cfg['follow_only']:
+            return True
+        if self.prechecked_price is not None:
+            allowed, price = self.prechecked_price
+            if not allowed:
+                self.status_updated.emit(
+                    f"⏭️ 预审价格 {price} 超过上限 {cfg['price_limit']}，跳过本轮")
+            return allowed
+        allowed, _ = self._evaluate_price_limit(cfg, frame=frame, silent_pass=False)
+        return allowed
+
+    @staticmethod
+    def _verify_thumb_from_roi(roi):
+        """提取确认按钮区域的轻量灰度特征图（耗时 <0.05ms），用于实时感知弹窗弹出与闭合"""
+        if roi is None or roi.size == 0:
+            return None
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        return cv2.resize(gray, (96, 24), interpolation=cv2.INTER_AREA)
+
+    def _verify_diff_ratio(self, verify_region, base_thumb, allow_cached=False) -> float:
+        """抓取 verify 区域并计算相对基准图的显著变化像素比例"""
+        if base_thumb is None:
+            return 0.0
+        roi, _ = self.win_cap.grab_region(verify_region, allow_cached=allow_cached)
+        if roi is None:
+            return 0.0
+        cur = self._verify_thumb_from_roi(roi)
+        if cur is None:
+            return 0.0
+        delta = cv2.absdiff(cur, base_thumb)
+        _, mask = cv2.threshold(delta, 20, 255, cv2.THRESH_BINARY)
+        return float(np.count_nonzero(mask)) / mask.size
+
+    def _prehover_buy_button(self, buy_region):
+        """在开抢前提前将鼠标移至「购买」按钮上方悬停，预先激活 UE4/UE5 控件 Hover 态"""
+        left, top, right, bottom = buy_region
+        hx = (left + right) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+        hy = (top + bottom) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+        fast_move(hx, hy)
+        self.hover_buy_pt = (hx, hy)
+        self.buy_hovered = True
+
+    def _buy_and_check(self, cfg, buy_region, verify_region, money_region,
+                       last_money_check, base_frame=None):
+        """视觉闭环极速抢购执行器：高频探测购买 → 毫秒级识别弹窗切入确认 → 智能无损善后
+
+        核心优化：
+          1. 摒弃固定点 2 下购买就盲点确认的开环模式：持续高频点击「购买」覆盖整个倒计时归零窗口，
+             同时以 <0.3ms 的局部区域抓帧监测 verify 区域像素突变；**一旦确认弹窗出现，立即中断购买连击、
+             毫秒级切入「确认」连击**（既不会早停漏掉 0 秒解锁，也不会弹窗已出还在傻等 0.3s）。
+          2. 结合 CountdownWatcher 锁定的亚秒跳秒相位（tick_age），在预计归零解锁区间 [0.80s, 1.25s]
+             自动加密点击频率至 ~25ms/次，抢占服务器解锁后的第一帧。
+          3. 确认连击期间检测到弹窗已关闭后补 1 下保险即提前收工，省掉空点消耗的 1 秒+。
+          4. 智能善后：先单次批量识别 skip / follow_count / money；若确认弹窗已自动关闭且画面已在
+             「我的关注」页，**绝不乱按 ESC**（彻底修复以前每次抢完按 ESC 把自己踢出关注页浪费 5~8 秒的问题）。
 
         Returns:
             (是否成功, 最新的三角币字符串)
         """
-        self.status_updated.emit("准备点击...")
-        time.sleep(cfg['buy_click_delay'])
-        self.status_updated.emit(f"连续点击购买 {cfg['buy_clicks']} 次...")
-        # 最后一次点完直接进下一步，不再等待：购买点完就该立刻去点确认，
-        # 在末尾多睡一个 buy_interval（默认 0.3 秒）纯属浪费
-        for i in range(cfg['buy_clicks']):
-            click_region_center(buy_region, interval=0)
-            if i < cfg['buy_clicks'] - 1:
-                time.sleep(cfg['buy_interval'])
-        time.sleep(cfg['buy_to_verify_delay'])
-        self.status_updated.emit(f"连续点击确认 {cfg['verify_clicks']} 次...")
-        for i in range(cfg['verify_clicks']):
-            click_region_center(verify_region, interval=0)
-            if i < cfg['verify_clicks'] - 1:
-                time.sleep(cfg['verify_interval'])
+        t_start = time.perf_counter()
+        tick_age_start = self.countdown.tick_age()
 
-        # 购买+确认点完，交易就已提交，直接按返回键回到关注列表：
-        # 不再等 1.5 秒结算、也不再点刷新。抢购窗口只有 1 秒，这两步纯是浪费
-        self.status_updated.emit("↩️ 购买+确认已点完，按返回键回到关注列表")
-        press_esc()
+        # 1) 采集点击前的确认按钮区域基准图（用于检测确认弹窗何时弹出、何时关闭）
+        base_thumb = None
+        if base_frame is not None and base_frame.size > 0:
+            base_thumb = self._verify_thumb_from_roi(self.frame_cut(base_frame, verify_region))
+        if base_thumb is None:
+            roi0, _ = self.win_cap.grab_region(verify_region, allow_cached=True)
+            base_thumb = self._verify_thumb_from_roi(roi0)
 
-        # 回到关注列表后等余额刷新，再识别三角币判断是否扣款
-        time.sleep(POST_BUY_SETTLE_SECONDS)
-        now_money = extract_and_merge_digits(self.ocr_region(money_region))
-        self.status_updated.emit(f"当前三角币: {now_money}")
+        if cfg['buy_click_delay'] > 0:
+            precise_sleep(cfg['buy_click_delay'])
 
-        # 识别失败时按失败处理，避免 OCR 返回空串被误判为"余额减少"
+        # 2) 阶段一：高频点击「购买」，实时侦测确认弹窗
+        if self.buy_hovered and self.hover_buy_pt is not None:
+            base_bx, base_by = self.hover_buy_pt
+        else:
+            bl, bt, br, bb = buy_region
+            base_bx = (bl + br) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+            base_by = (bt + bb) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+
+        max_buy_clicks = max(1, int(cfg['buy_clicks']))
+        cfg_buy_interval = float(cfg['buy_interval'])
+        popup_opened = False
+        popup_ms = None
+        actual_buy_clicks = 0
+
+        for i in range(max_buy_clicks):
+            # 微幅抖动保持在购买按钮内部，不丢失 UE4 Hover 焦点
+            bx = base_bx + random.randint(-2, 2)
+            by = base_by + random.randint(-2, 2)
+            fast_click(bx, by, hold=CLICK_HOLD_SECONDS, move=(i > 0 or not self.buy_hovered))
+            actual_buy_clicks += 1
+
+            # 立即探测一次弹窗是否已经弹出
+            if self._verify_diff_ratio(verify_region, base_thumb) >= VERIFY_POPUP_OPEN_RATIO:
+                popup_opened = True
+                popup_ms = int((time.perf_counter() - t_start) * 1000)
+                break
+
+            if i >= max_buy_clicks - 1:
+                break
+
+            # 在预计的倒计时归零点附近（距跳秒 0.80s~1.25s）自动把探测间隔收紧到 <=25ms
+            cur_tick_age = self.countdown.tick_age()
+            if cur_tick_age is not None and 0.78 <= cur_tick_age <= 1.28:
+                step_wait = min(cfg_buy_interval, 0.025)
+            else:
+                step_wait = cfg_buy_interval
+
+            # 分片等待：等待期间每 ~8ms 探一次弹窗，弹窗一出一毫秒都不多等！
+            wait_deadline = time.perf_counter() + step_wait
+            while time.perf_counter() < wait_deadline:
+                remain = wait_deadline - time.perf_counter()
+                precise_sleep(min(0.008, max(0.0, remain)))
+                if self._verify_diff_ratio(verify_region, base_thumb) >= VERIFY_POPUP_OPEN_RATIO:
+                    popup_opened = True
+                    popup_ms = int((time.perf_counter() - t_start) * 1000)
+                    break
+            if popup_opened:
+                break
+
+        if cfg['buy_to_verify_delay'] > 0:
+            precise_sleep(cfg['buy_to_verify_delay'])
+
+        # 3) 阶段二：极速连点「确认」，检测到弹窗闭合后补 1 下立即收工
+        vl, vt, vr, vb = verify_region
+        base_vx = (vl + vr) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+        base_vy = (vt + vb) // 2 + random.randint(-CLICK_JITTER_PX, CLICK_JITTER_PX)
+        cfg_verify_clicks = max(1, int(cfg['verify_clicks']))
+        # 若全程未检测到弹窗变化，仍保留最多 8 次兜底确认点击（防 verify 坐标微偏或半透明弹窗）
+        max_verify = cfg_verify_clicks if popup_opened else min(cfg_verify_clicks, 8)
+        verify_interval = float(cfg['verify_interval'])
+        actual_verify_clicks = 0
+        popup_closed_early = False
+
+        for i in range(max_verify):
+            vx = base_vx + random.randint(-2, 2)
+            vy = base_vy + random.randint(-2, 2)
+            fast_click(vx, vy, hold=0.007, move=True)
+            actual_verify_clicks += 1
+
+            if i >= max_verify - 1:
+                break
+            if verify_interval > 0:
+                precise_sleep(verify_interval)
+
+            # 弹窗曾打开过、且已点满至少 2 次确认后，若 verify 区域已恢复回列表背景则说明弹窗已提交关闭
+            if popup_opened and i >= 1:
+                diff_now = self._verify_diff_ratio(verify_region, base_thumb)
+                if 0.0 < diff_now <= VERIFY_POPUP_CLOSED_RATIO:
+                    # 补最后 1 下安全点击后退出循环
+                    fast_click(base_vx, base_vy, hold=0.007, move=False)
+                    actual_verify_clicks += 1
+                    popup_closed_early = True
+                    break
+
+        burst_ms = int((time.perf_counter() - t_start) * 1000)
+        tick_info = f"跳秒+{int(tick_age_start * 1000)}ms" if tick_age_start is not None else "首帧直触发"
+        popup_info = f"{popup_ms}ms检出弹窗" if popup_opened else "未检出弹窗变化(兜底点击)"
+        close_info = ", 弹窗闭合即停" if popup_closed_early else ""
+        self.status_updated.emit(
+            f"⚡ 抢购连击完成({burst_ms}ms | {tick_info} | 买×{actual_buy_clicks}[{popup_info}] "
+            f"→ 确认×{actual_verify_clicks}{close_info})"
+        )
+
+        # 4) 阶段三：智能无损善后（已在关注页则绝不乱按 ESC，避免自踢出关注页！）
+        precise_sleep(POST_BUY_INITIAL_WAIT)
+        post_frame = self.capture(max_cache_age=0.02)
+        if post_frame is None:
+            post_frame = self.capture()
+
+        skip_region = self.selector.get_region("skip") or _rect_from_ratio(SKIP_BUTTON_RECT_RATIO)
+        follow_cnt_region = get_region(self.selector, "follow_count")
+        now_money = ""
+
+        if post_frame is not None and post_frame.size > 0:
+            batch = self.ocr_regions_batch(
+                [("skip", skip_region), ("follow_count", follow_cnt_region), ("money", money_region)],
+                post_frame,
+            )
+            skip_items = batch.get("skip", ())
+            skip_hit = next((((x1 + x2) // 2, (y1 + y2) // 2)
+                             for txt, x1, y1, x2, y2 in skip_items if "跳过" in txt), None)
+            follow_txt = "".join(t for t, *_ in batch.get("follow_count", ()))
+            money_txt = "".join(t for t, *_ in batch.get("money", ()))
+            now_money = extract_and_merge_digits(money_txt)
+
+            if skip_hit is not None:
+                logger.info(f"[抢购善后] 检测到获得外观结果页，点击跳过 {skip_hit}")
+                self.status_updated.emit("⏭️ 检测到获得外观结果页，点击跳过")
+                click_point(skip_hit)
+                precise_sleep(0.45)
+                now_money = extract_and_merge_digits(self.ocr_region(money_region))
+            else:
+                on_follow = bool(FOLLOW_COUNT_PATTERN.search(follow_txt))
+                modal_still_open = (
+                    base_thumb is not None
+                    and self._verify_diff_ratio(verify_region, base_thumb, allow_cached=True)
+                    >= VERIFY_POPUP_OPEN_RATIO
+                )
+                if not on_follow or modal_still_open:
+                    # 只有弹窗仍卡在画面上或遮挡了关注页标识时，才按一次轻量 ESC 关闭弹窗
+                    logger.info("[抢购善后] 弹窗仍打开或未见关注标识，按 ESC 关闭遮挡层")
+                    press_esc(wait=0.30)
+                    after_esc = self.capture(max_cache_age=0.05) or self.capture()
+                    if after_esc is not None and after_esc.size > 0:
+                        self._try_skip_result_page(after_esc)
+                    now_money = extract_and_merge_digits(self.ocr_region(money_region))
+        else:
+            press_esc(wait=0.30)
+            now_money = extract_and_merge_digits(self.ocr_region(money_region))
+
+        # 5) 核对三角币余额：若首次读取已扣款立即判定成功；否则短等一次服务器结算刷新再复核
         now_money_int = _to_int(now_money)
         last_money_int = _to_int(last_money_check)
         success = (now_money_int is not None and last_money_int is not None
                    and now_money_int < last_money_int)
+        if not success:
+            precise_sleep(POST_BUY_SETTLE_SECONDS)
+            retry_frame = self.capture(max_cache_age=0.02) or self.capture()
+            retry_money = extract_and_merge_digits(self.ocr_region(money_region, retry_frame))
+            if retry_money:
+                now_money = retry_money
+                now_money_int = _to_int(now_money)
+                success = (now_money_int is not None and last_money_int is not None
+                           and now_money_int < last_money_int)
+
+        self.status_updated.emit(f"当前三角币: {now_money or '未读到'}")
         if success:
             self.status_updated.emit(f"✅ 购买成功！扣除三角币，当前: {now_money}")
         return success, now_money
 
     def run(self):
         """运行脚本：准备阶段（筛选 + 加关注）→ 抢购阶段（我的关注页）"""
+        with _WindowsTimerResolution(1):
+            self._run_loop()
+
+    def _run_loop(self):
         try:
             self.status_updated.emit("初始化中...")
 
@@ -913,7 +1383,6 @@ class ScriptThread(QThread):
             refresh_region = self.selector.get_region("refresh")
             money_region = self.selector.get_region("money")
 
-            # 缺少区域配置时直接报错，避免后续裁剪/点击抛出不明确的异常
             required = {
                 "time": time_region, "buy": buy_region, "verify": verify_region,
                 "refresh": refresh_region, "money": money_region,
@@ -922,24 +1391,18 @@ class ScriptThread(QThread):
             if missing:
                 raise ValueError(f"区域配置缺失: {', '.join(missing)}，请检查 regions_2k.json")
 
-            # 起点两种都支持：停在「典藏外观」列表页走完整准备阶段；
-            # 若游戏已经停在「我的关注」页，则跳过准备阶段直接抢购
             if self._get_config().get('follow_only'):
                 self.status_updated.emit("监控中...（仅关注页模式：请停在「我的关注」页）")
             else:
                 self.status_updated.emit("监控中...（请停在「典藏外观」或「我的关注」页）")
 
             while self.is_running:
-                # 暂停时等待
                 while self.is_paused and self.is_running:
                     time.sleep(0.2)
 
-                # 每轮重新读取配置，使 GUI 中修改的参数即时生效
                 cfg = self._get_config()
 
                 # === 仅关注页模式 ===
-                # 勾选后跳过整个准备阶段（不筛选商品、不自动加关注），直接在
-                # 「我的关注」页抢购。运行中随时勾选/取消都会在下一轮生效
                 if cfg['follow_only'] and self.phase == PHASE_PREPARE:
                     self.phase = PHASE_SNIPE
                     self.last_page = None
@@ -949,7 +1412,6 @@ class ScriptThread(QThread):
                         "🎯 仅关注页模式：跳过准备阶段，直接在「我的关注」页抢购")
 
                 # === 市场关闭时段检查 ===
-                # 放在所有点击动作之前：市场关着时空点毫无意义，还容易触发卡死恢复
                 if _market_closed(datetime.now(),
                                   cfg['market_close_time'], cfg['market_open_time']):
                     self.status_updated.emit(
@@ -960,8 +1422,6 @@ class ScriptThread(QThread):
                     break
 
                 # === 防卡死检查 ===
-                # 必须放在截图/OCR 之前：页面卡死或被弹窗遮挡时 OCR 根本读不到特征文本，
-                # 若放在后面的 early-continue 之后，这种最需要恢复的场景永远触发不了
                 stall_threshold = (SELF_HEAL_STALL_SECONDS if self.phase == PHASE_SNIPE
                                    else PREPARE_STALL_SECONDS)
                 stall_seconds = time.time() - self.last_progress_time
@@ -978,20 +1438,29 @@ class ScriptThread(QThread):
                         self.mark_progress()
                     continue
 
-                # 截图并识别当前页面（本轮复用同一张截图，避免重复截屏）
-                frame = self.capture()
-                if frame is None or frame.size == 0:
-                    time.sleep(PREPARE_POLL_INTERVAL)
-                    continue
-                # 抢购阶段的热路径：上一轮刚读到过倒计时，说明当时确实在关注页上，
-                # 这一轮就不必再做页面识别（它也靠 OCR 关注页标识，属于重复劳动）。
-                # 末尾几秒每秒要轮询十几次，省掉的这次 OCR 直接变成点击延迟；
-                # 一旦读不到倒计时，_snipe_step 会把 snipe_live 置回 False，
-                # 下一轮就恢复完整的页面识别
+                # === 抢购热路径：区分新帧与静止画面，彻底消除原版无新帧时误睡 300ms 的致命黑洞 ===
                 if self.phase == PHASE_SNIPE and self.snipe_live:
+                    frame, is_new = self.capture_fresh()
+                    if not is_new and not self.countdown.resync_due():
+                        cd_val = self.countdown.value()
+                        if cd_val is not None and cd_val <= 5:
+                            precise_sleep(FAST_POLL_INTERVAL)
+                        elif cd_val is not None and cd_val <= 12:
+                            precise_sleep(MEDIUM_POLL_INTERVAL)
+                        else:
+                            precise_sleep(min(cfg['ocr_interval'], 0.12))
+                        continue
+                    if frame is None or frame.size == 0:
+                        precise_sleep(FAST_POLL_INTERVAL)
+                        continue
                     page = PAGE_FOLLOW
                 else:
+                    frame = self.capture()
+                    if frame is None or frame.size == 0:
+                        precise_sleep(0.05 if self.phase == PHASE_SNIPE else PREPARE_POLL_INTERVAL)
+                        continue
                     page = detect_page(self, self.selector, frame)
+
                 if page != self.last_page:
                     logger.info(f"[页面] {self.last_page} -> {page}")
                     self.status_updated.emit(f"🖥️ 当前页面：{PAGE_NAMES.get(page, page)}")
@@ -1003,19 +1472,23 @@ class ScriptThread(QThread):
                     if page == PAGE_FOLLOW:
                         self.unknown_rounds = 0
                         self.return_follow_rounds = 0
-                        if self.follow_sort_tries < FOLLOW_SORT_TRY_LIMIT:
-                            # 进入关注页先确保排序是「按稀有度升序」。它要 OCR + 点几下，
-                            # 放进倒计时的热路径里会拖慢抢购，所以最多试 FOLLOW_SORT_TRY_LIMIT 轮；
-                            # 某一轮没搞定（下拉面板没展开出来等）下一轮接着试
+                        # 排序检查避让临期抢购：首次进入先读一轮倒计时；若当前商品只剩 <=7 秒即将开抢，
+                        # 绝对优先抢购，推迟排序切换以免错过眼前这件商品！
+                        cur_cd = self.countdown.value()
+                        if (self.snipe_checked_once
+                                and self.follow_sort_tries < FOLLOW_SORT_TRY_LIMIT
+                                and (cur_cd is None or cur_cd > 7)):
                             self.follow_sort_tries += 1
                             if self.flow.ensure_follow_sort(frame):
                                 self.follow_sort_tries = FOLLOW_SORT_TRY_LIMIT
+                                # 切换排序可能改变榜首商品，通知倒计时观察器与价格预审重同步
+                                self.countdown.mark_refreshed(0.20)
+                                self.prechecked_price = None
+                                self.buy_hovered = False
+
+                        self.snipe_checked_once = True
                         if self._snipe_step(frame, cfg) == "empty":
                             if cfg['follow_only']:
-                                # 仅关注页模式：列表抢完就停在原地等用户手动加关注，
-                                # 不退出关注页、也不回准备阶段。这里必须 mark_progress，
-                                # 否则 5 秒后看门狗会来"恢复"（点刷新），连续几次还会
-                                # 判成"恢复无效"直接把脚本停掉 —— 而这是有意为之的等待
                                 self.mark_progress()
                                 if not self.follow_wait_notified:
                                     self.follow_wait_notified = True
@@ -1030,18 +1503,12 @@ class ScriptThread(QThread):
                                 self._leave_follow_page()
                                 self._leave_snipe()
                         else:
-                            # 又读到了关注页的内容（用户加完关注回来了），
-                            # 允许下次抢空时再提醒一次
                             self.follow_wait_notified = False
                     elif page == PAGE_UNKNOWN:
-                        # 可能是购买后弹出的"获得外观"结果页
                         if self._try_skip_result_page(frame):
                             self.unknown_rounds = 0
                             self.mark_progress()
                         elif cfg['follow_only']:
-                            # 仅关注页模式：认不出画面又不是结果页（多半是您手动翻到了
-                            # 别的页面）。这里刻意什么都不点，免得干扰您手动操作，
-                            # 只等您自己切回「我的关注」页
                             self.mark_progress()
                             if not self.follow_wait_notified:
                                 self.follow_wait_notified = True
@@ -1049,15 +1516,11 @@ class ScriptThread(QThread):
                                     "⏸ 仅关注页模式：当前不在「我的关注」页，请手动切回")
                             time.sleep(FOLLOW_WAIT_POLL_SECONDS)
                         else:
-                            # 连续多轮都认不出画面：多半是购买后的结果页没点掉、或页面
-                            # 状态异常。不再直接退回准备阶段，先设法导航回关注页
                             self.unknown_rounds += 1
                             if self.unknown_rounds >= SNIPE_UNKNOWN_LIMIT:
                                 self.unknown_rounds = 0
                                 self._nav_back_to_follow(PAGE_UNKNOWN, frame)
                     elif cfg['follow_only']:
-                        # 仅关注页模式：不在「我的关注」页时什么都不点（绝不导航，
-                        # 免得干扰您正在手动挑商品），只等您自己切回关注页
                         self.mark_progress()
                         if not self.follow_wait_notified:
                             self.follow_wait_notified = True
@@ -1066,17 +1529,12 @@ class ScriptThread(QThread):
                                 f"（{PAGE_NAMES.get(page, page)}），请手动切回")
                         time.sleep(FOLLOW_WAIT_POLL_SECONDS)
                     else:
-                        # 意外离开了关注页：先设法导航回关注页继续抢购，而不是直接
-                        # 退回准备阶段。抢购成功后的结果页 + ESC 很容易落到列表页或
-                        # 在售页，这时回准备阶段会把已经关注好的商品全部作废重来
                         self._nav_back_to_follow(page, frame)
                     continue
 
                 # -------------------- 准备阶段 --------------------
+                action = "running"
                 if page == PAGE_UNKNOWN:
-                    # 先看是不是购买后弹出的"获得外观"结果页；连续多轮都认不出画面
-                    # 时主动执行一次通用恢复（关弹窗 / 退回上一层），否则会一直在这里
-                    # 空转，直到 PREPARE_STALL_SECONDS 之后才被看门狗兜住
                     self._try_skip_result_page(frame)
                     self.prepare_unknown_rounds += 1
                     if self.prepare_unknown_rounds >= PREPARE_UNKNOWN_LIMIT:
@@ -1095,20 +1553,16 @@ class ScriptThread(QThread):
                         self.mark_progress()
                         continue
                     if action == "leave_follow":
-                        # 关注列表是空的：进抢购只会空转（见 _leave_follow_page），
-                        # 说明上一次的"退出关注页"还没生效，这里先确保真的退出去
                         self.status_updated.emit("📭 关注列表为空，退出关注页重新筛选")
                         self._leave_follow_page()
 
-                time.sleep(PREPARE_POLL_INTERVAL)
+                precise_sleep(PREPARE_FAST_INTERVAL if action == "fast" else PREPARE_POLL_INTERVAL)
         except Exception as e:
             self.status_updated.emit(f"错误: {str(e)}")
             logger.error("脚本运行错误", exc_info=True)
 
     def _snipe_step(self, frame, cfg) -> str:
         """执行一轮「我的关注」页抢购逻辑
-
-        逻辑与旧版单体循环一致，只是把等待/分支改为返回状态，由 run() 负责阶段切换。
 
         Returns:
             'continue' 继续抢购
@@ -1120,76 +1574,94 @@ class ScriptThread(QThread):
         refresh_region = self.selector.get_region("refresh")
         money_region = self.selector.get_region("money")
 
-        # 抢购窗口只有 1 秒，末尾每秒要轮询十几次，这里每多一次 OCR 就多几十~几百
-        # 毫秒的识别延迟（CPU 上尤其明显），直接变成"比别人慢 0.x 秒"。
-        # 因此先做像素差分：画面没变就直接用缓存值；只有数字跳格时才 OCR，
-        # 其余判断全部推迟到"读不到倒计时"时再做（细节见 CountdownWatcher）
         self.snipe_live = False
         kind, total_seconds = self.countdown.update(
             frame, time_region, lambda: self.ocr_region(time_region, frame))
         if kind == "long":
             click_region_center(refresh_region)
+            self.countdown.mark_refreshed(0.25)
+            self.prechecked_price = None
+            self.buy_hovered = False
             self.mark_progress()
-            time.sleep(cfg['ocr_interval'])
+            precise_sleep(cfg['ocr_interval'])
             return "continue"
         if kind == "unknown":
-            # 读不到倒计时，才需要花时间判断页面状态
-            # 关注列表清空 → 本轮抢购结束（列表空了自然也就没有倒计时可读）
             joined, _total = read_follow_count(self, self.selector, frame)
             if joined == 0:
-                # 仅关注页模式下会一直停在这一页等用户手动加关注，这里不再每轮刷
-                # "已无商品"（否则会把 run() 的一次性提醒顶掉），提醒统一由 run() 负责
                 if not cfg['follow_only']:
                     self.status_updated.emit("📭 关注列表已无商品")
                 return "empty"
-            # 优先判断是否为"获得外观"结果页，是就点"跳过"走人；
-            # 该页面会完全挡住交易行，不点掉会一直卡住
             if self._try_skip_result_page(frame):
                 self.mark_progress()
                 self.last_total = None
-                time.sleep(FAST_POLL_INTERVAL)
+                precise_sleep(FAST_POLL_INTERVAL)
                 return "continue"
-            time.sleep(cfg['ocr_interval'])
+            precise_sleep(min(cfg['ocr_interval'], 0.25))
             return "continue"
 
-        # 读到倒计时说明确实在关注页上：给 run() 一个信号，下一轮可以跳过页面识别
         self.snipe_live = True
         minutes, seconds = divmod(total_seconds, 60)
-        # 更新时间显示
         self.timer_updated.emit(str(minutes), str(seconds))
 
-        # 剩余时间变大说明刷新出了新一轮，重置本轮标志（否则同一轮会重复点击）
+        # 剩余时间变大说明刷新出了新一轮商品，重置本轮所有抢购与预检状态
         if self.last_total is not None and total_seconds > self.last_total:
             self.refreshed = False
             self.buy_done = False
+            self.prechecked_price = None
+            self.buy_hovered = False
 
-        # 倒计时数值发生变化即视为"有进展"，重置卡死计时
         if total_seconds != self.last_total:
             self.mark_progress()
         self.last_total = total_seconds
 
-        # 剩余指定秒数时点击刷新（每轮仅触发一次）。
-        # 用 <= 兜底：OCR 误读或本地递减都可能整格跳过"5 秒"，严格相等会整轮不刷新
+        # 1) 剩余 <= 5 秒时点击一次刷新，并标记刷新回包后强制 OCR 校准倒计时与重审价格
         if (total_seconds <= REFRESH_TRIGGER_SECONDS
                 and cfg['click_refresh_enabled'] and not self.refreshed):
             self.status_updated.emit(f"🔄 剩余{total_seconds}秒，点击刷新...")
             click_region_center(refresh_region)
             self.refreshed = True
+            self.prechecked_price = None
+            self.buy_hovered = False
+            self.countdown.mark_refreshed(0.22)
             self.mark_progress()
-            time.sleep(FAST_POLL_INTERVAL)
+            precise_sleep(0.05)
             return "continue"
 
-        # 剩余 1 秒及以内执行购买；用 <= 兜底，避免 OCR 漏掉那一秒导致整轮不点击
+        # 2) 刷新稳定后的空闲窗口（2s <= t <= 4s）：提前完成榜首商品价格预审 + 鼠标预悬停至购买钮！
+        #    这样进入 t <= 1s 抢购临界点时直接零 OCR、零移动延迟瞬间开火！
+        if 1 < total_seconds <= 4 and not self.countdown.resync_due():
+            if not cfg['follow_only'] and self.prechecked_price is None:
+                allowed, p_val = self._evaluate_price_limit(cfg, frame=frame, silent_pass=True)
+                if p_val is not None or (allowed and not self.selector.get_region("price")):
+                    self.prechecked_price = (allowed, p_val)
+                    if allowed and p_val is not None:
+                        logger.info(f"[预审] 榜首商品价格 {p_val} <= 上限 {cfg['price_limit']}，已就绪")
+                    elif not allowed:
+                        logger.info(f"[预审] 榜首商品价格 {p_val} > 上限 {cfg['price_limit']}，本轮将跳过")
+            if total_seconds <= 3 and not self.buy_hovered:
+                if self.prechecked_price is None or self.prechecked_price[0]:
+                    self._prehover_buy_button(buy_region)
+
+        # 3) 剩余 1 秒及以内（含 0 秒瞬间）执行视觉闭环极速抢购
         if total_seconds <= 1 and not self.buy_done:
             self.buy_done = True
-            # 价格超过上限（或价格读不出来）时本轮不购买，直接刷新等下一轮
-            if not self._price_within_limit(cfg):
+            if not self._price_within_limit(cfg, frame=frame):
                 click_region_center(refresh_region)
+                self.countdown.mark_refreshed(0.25)
+                self.prechecked_price = None
+                self.buy_hovered = False
                 self.mark_progress()
                 return "continue"
+
             success, money_now = self._buy_and_check(
-                cfg, buy_region, verify_region, money_region, self.last_money_check,
+                cfg, buy_region, verify_region, money_region,
+                self.last_money_check, base_frame=frame,
             )
+            # 本轮出手完毕，清空预检与悬停状态供下一件商品使用
+            self.prechecked_price = None
+            self.buy_hovered = False
+            self.countdown.reset()
+
             if success:
                 self.consecutive_fail_count = 0
                 self.last_money_check = money_now
@@ -1205,12 +1677,8 @@ class ScriptThread(QThread):
             else:
                 self.consecutive_fail_count += 1
                 self.status_updated.emit(
-                    f"⚠️ 未检测到扣款（连续失败: {self.consecutive_fail_count}/{MAX_FAIL_COUNT}）"
+                    f"⚠️ 未检测到扣款（连续未中签: {self.consecutive_fail_count}/{MAX_FAIL_COUNT}）"
                 )
-                # 连续失败达到阈值 → 只提示，不做任何界面操作。
-                # 市场改成"随机抽选购买资格"后，连点几十轮都没中签是正常现象；
-                # 以前这里当成界面卡死、按 ESC 恢复，反而把关注页/上一页打乱
-                # （实测日志 19:10:40：连续 10 次未扣款后立刻触发 [防卡死] 恢复）
                 if self.consecutive_fail_count >= MAX_FAIL_COUNT:
                     logger.warning(
                         f"[抢购] 连续 {MAX_FAIL_COUNT} 轮未中签"
@@ -1220,13 +1688,17 @@ class ScriptThread(QThread):
                         "（随机抽选机制下属正常现象）")
                     self.consecutive_fail_count = 0
 
-            # 购买流程本身也算"有进展"，重置卡死计时避免误判
             self.mark_progress()
             self.status_updated.emit("继续监控中...")
             return "continue"
 
-        # 距离触发点还早时按配置间隔识别，末尾几秒改为高频轮询以抓住触发窗口
-        time.sleep(cfg['ocr_interval'] if total_seconds > 5 else FAST_POLL_INTERVAL)
+        # 4) 分级动态轮询：t<=5s 4ms 帧级追踪，5<t<=12s 80ms 准点卡刷新，t>12s 按用户间隔
+        if total_seconds <= 5:
+            precise_sleep(FAST_POLL_INTERVAL)
+        elif total_seconds <= 12:
+            precise_sleep(MEDIUM_POLL_INTERVAL)
+        else:
+            precise_sleep(cfg['ocr_interval'])
         return "continue"
     
     def pause(self):
@@ -1263,6 +1735,23 @@ def main():
         return
 
     window = MonitorWindow()
+    user_cfg_path = os.path.join(base_dir, USER_CONFIG_FILE)
+    if os.path.isfile(user_cfg_path):
+        try:
+            with open(user_cfg_path, "r", encoding="utf-8") as f:
+                window.load_config(json.load(f))
+            logger.info(f"已加载用户配置: {user_cfg_path}")
+        except Exception as e:
+            logger.warning(f"加载 {USER_CONFIG_FILE} 失败，使用默认配置: {e}")
+
+    def save_user_config():
+        try:
+            with open(user_cfg_path, "w", encoding="utf-8") as f:
+                json.dump(window.get_config(), f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            logger.debug(f"保存用户配置失败: {e}")
+
+    window.controller.config_changed.connect(save_user_config)
     window.show()
     # 移到屏幕右侧纵向居中。置顶窗口会和游戏画面叠加，必须避开所有已标定区域，
     # 尤其是左下角的 follow_count（详见 WINDOW_LEFT_RATIO 处的说明）

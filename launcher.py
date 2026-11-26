@@ -36,7 +36,7 @@ SOURCE_FILES = [
 
 # 这些是用户自己的标定数据，不能直接覆盖：否则用户重标过的坐标会被内置版本冲掉。
 # 处理方式是"内置作底、用户值优先"做 key 合并：既保留用户标定，又能补上新版本新增的区域
-USER_DATA_FILES = {"regions_2k.json"}
+USER_DATA_FILES = {"regions_2k.json", "user_config.json"}
 
 # 依赖探测：只用 find_spec，不真的 import（import paddle 要好几秒）
 CHECK_CODE = (

@@ -32,6 +32,7 @@ class ScriptController(QObject):
     pause_requested = pyqtSignal()
     resume_requested = pyqtSignal()
     preview_requested = pyqtSignal()
+    config_changed = pyqtSignal()
 
 
 class MonitorWindow(QMainWindow):
@@ -48,16 +49,14 @@ class MonitorWindow(QMainWindow):
         self.seconds = "--"
         self.status = "就绪"
         
-        # 配置变量
-        # 识别到倒计时到点后、点第一下「购买」前的等待（秒）。抢购窗口只有 1 秒，
-        # 这段等待会直接变成比别人慢的时间，默认 0.30 秒留一点缓冲，想更快可调小（见 使用说明.md）
-        self.buy_click_delay = 0.30  # 购买点击延迟（秒）
-        self.buy_to_verify_delay = 0.0  # 购买到确认的延迟（秒）
-        self.buy_interval = 0.30  # 购买按钮点击间隔（秒）
-        self.buy_clicks = 2  # 购买按钮连续点击次数
-        self.verify_interval = 0.07  # 确认按钮点击间隔（秒）
-        self.verify_clicks = 25  # 确认按钮连续点击次数
-        self.ocr_interval = 0.95  # OCR识别间隔（time >= 5）（秒）
+        # 配置变量（针对毫秒级视觉闭环抢购调优的实战默认值）
+        self.buy_click_delay = 0.00  # 购买点击延迟（秒）：默认 0 秒零延迟直接探测
+        self.buy_to_verify_delay = 0.00  # 购买到确认的延迟（秒）
+        self.buy_interval = 0.05  # 购买按钮探测点击间隔（秒）：50ms 高频覆盖解锁窗口，检出弹窗即停
+        self.buy_clicks = 24  # 购买按钮最大点击次数：覆盖完整 1.2s+ 跨秒窗口，弹窗弹出后立即中断
+        self.verify_interval = 0.03  # 确认按钮点击间隔（秒）：30ms 极速确认
+        self.verify_clicks = 20  # 确认按钮最大连续点击次数：弹窗闭合后自动提前收工
+        self.ocr_interval = 0.50  # OCR识别间隔（time > 12s）（秒）
         self.price_limit = 230  # 价格上限（三角币），超过则本轮不购买
         self.click_refresh_enabled = True  # 倒计时剩余5秒时点击刷新（阈值见 main_gui.REFRESH_TRIGGER_SECONDS）
         # 仅在我的关注页抢购：跳过整个准备阶段（不筛选、不自动加关注），
@@ -187,7 +186,7 @@ class MonitorWindow(QMainWindow):
         self.delay_spin = QDoubleSpinBox()
         self.delay_spin.setRange(0.0, 5.0)
         self.delay_spin.setValue(self.buy_click_delay)
-        self.delay_spin.setSingleStep(0.1)
+        self.delay_spin.setSingleStep(0.02)
         self.delay_spin.setDecimals(2)
         self.delay_spin.setSuffix(" 秒")
         self.delay_spin.setFont(QFont("微软雅黑", 10))
@@ -257,7 +256,7 @@ class MonitorWindow(QMainWindow):
         buy_clicks_label.setFont(QFont("微软雅黑", 10))
         buy_clicks_label.setFixedWidth(120)
         self.buy_clicks_spin = QSpinBox()
-        self.buy_clicks_spin.setRange(1, 30)
+        self.buy_clicks_spin.setRange(1, 60)
         self.buy_clicks_spin.setValue(self.buy_clicks)
         self.buy_clicks_spin.setSuffix(" 次")
         self.buy_clicks_spin.setFont(QFont("微软雅黑", 10))
@@ -273,7 +272,7 @@ class MonitorWindow(QMainWindow):
         verify_clicks_label.setFont(QFont("微软雅黑", 10))
         verify_clicks_label.setFixedWidth(120)
         self.verify_clicks_spin = QSpinBox()
-        self.verify_clicks_spin.setRange(1, 30)
+        self.verify_clicks_spin.setRange(1, 60)
         self.verify_clicks_spin.setValue(self.verify_clicks)
         self.verify_clicks_spin.setSuffix(" 次")
         self.verify_clicks_spin.setFont(QFont("微软雅黑", 10))
@@ -468,6 +467,8 @@ class MonitorWindow(QMainWindow):
         
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        # 限制最大缓存行数，避免长时间挂机后富文本重排吃内存与拖慢主线程/GPU 合成
+        self.log_text.document().setMaximumBlockCount(500)
         self.log_text.setMaximumHeight(100)
         # 明确给一个很小的最小高度：日志框默认的最小高度会把整个窗口顶高 60 多像素，
         # 而窗口是置顶的，底部会压到游戏结果页的「跳过」区域（详见 main_gui.WINDOW_TOP_RATIO）
@@ -621,85 +622,163 @@ class MonitorWindow(QMainWindow):
         """购买点击延迟变更"""
         self.buy_click_delay = value
         self.add_log(f"⚙️ 购买点击延迟已设置为: {value}秒")
-    
+        self.controller.config_changed.emit()
+
     def on_buy_to_verify_delay_changed(self, value):
         """购买到确认延迟变更"""
         self.buy_to_verify_delay = value
         self.add_log(f"⚙️ 购买确认间延迟已设置为: {value}秒")
-    
+        self.controller.config_changed.emit()
+
     def on_buy_interval_changed(self, value):
         """购买点击间隔变更"""
         self.buy_interval = value
         self.add_log(f"⚙️ 购买点击间隔已设置为: {value}秒")
-    
+        self.controller.config_changed.emit()
+
     def on_verify_interval_changed(self, value):
         """确认点击间隔变更"""
         self.verify_interval = value
         self.add_log(f"⚙️ 确认点击间隔已设置为: {value}秒")
-    
+        self.controller.config_changed.emit()
+
     def on_buy_clicks_changed(self, value):
         """购买点击次数变更"""
         self.buy_clicks = value
         self.add_log(f"⚙️ 购买点击次数已设置为: {value}次")
+        self.controller.config_changed.emit()
 
     def on_verify_clicks_changed(self, value):
         """确认点击次数变更"""
         self.verify_clicks = value
         self.add_log(f"⚙️ 确认点击次数已设置为: {value}次")
+        self.controller.config_changed.emit()
 
     def on_ocr_interval_changed(self, value):
         """OCR识别间隔变更"""
         self.ocr_interval = value
         self.add_log(f"⚙️ OCR识别间隔已设置为: {value}秒")
-    
+        self.controller.config_changed.emit()
+
     def on_price_limit_changed(self, value):
         """价格上限变更"""
         self.price_limit = value
         self.add_log(f"⚙️ 价格上限已设置为: {value}三角币")
-    
+        self.controller.config_changed.emit()
+
     def on_target_season_changed(self, value):
         """目标赛季变更"""
         self.target_season = value.strip()
         self.add_log(f"⚙️ 目标赛季已设置为: {self.target_season}")
+        self.controller.config_changed.emit()
 
     def on_target_tier_changed(self, value):
         """目标品阶变更"""
         self.target_tier = value
         self.add_log(f"⚙️ 目标品阶已设置为: {value}")
+        self.controller.config_changed.emit()
 
     def on_target_grade_changed(self, value):
         """目标成色变更"""
         self.target_grade = value
         self.add_log(f"⚙️ 目标成色已设置为: {value}")
+        self.controller.config_changed.emit()
 
     def on_stop_count_changed(self, value):
         """抢到 N 个后停止"""
         self.stop_after_count = value
         status = "不限" if value == 0 else f"{value} 个"
         self.add_log(f"⚙️ 抢购数量上限已设置为: {status}")
-    
+        self.controller.config_changed.emit()
+
     def on_refresh_changed(self, state):
         """剩余5秒时点击刷新选项变更"""
         self.click_refresh_enabled = self.refresh_checkbox.isChecked()
         status = "启用" if self.click_refresh_enabled else "禁用"
         self.add_log(f"⚙️ 剩余5秒时点击刷新: {status}")
+        self.controller.config_changed.emit()
 
     def on_follow_only_changed(self, state):
         """仅在我的关注页抢购 选项变更"""
         self.follow_only = self.follow_only_checkbox.isChecked()
         status = "启用" if self.follow_only else "禁用"
         self.add_log(f"⚙️ 仅在我的关注页抢购: {status}")
+        self.controller.config_changed.emit()
 
     def on_market_time_changed(self, _text):
-        """市场关闭/开市时间变更
-
-        不做格式校验，直接透传给主逻辑：时间填错或填反时 main_gui._market_closed
-        会返回 False（即不启用该功能），不会把脚本永久挡住
-        """
+        """市场关闭/开市时间变更"""
         self.market_close_time = self.market_close_edit.text().strip()
         self.market_open_time = self.market_open_edit.text().strip()
         self.add_log(f"⚙️ 市场关闭时段已设置为: "
                      f"{self.market_close_time or '未填'} ~ {self.market_open_time or '未填'}")
+        self.controller.config_changed.emit()
+
+    def load_config(self, cfg: dict):
+        """从持久化字典恢复界面配置（静默更新控件，不触发初始化刷屏日志）"""
+        if not isinstance(cfg, dict):
+            return
+        widgets = (
+            self.delay_spin, self.buy_to_verify_spin, self.buy_interval_spin,
+            self.verify_interval_spin, self.buy_clicks_spin, self.verify_clicks_spin,
+            self.ocr_interval_spin, self.price_limit_spin, self.season_combo,
+            self.tier_combo, self.grade_combo, self.stop_count_spin,
+            self.refresh_checkbox, self.follow_only_checkbox,
+            self.market_close_edit, self.market_open_edit,
+        )
+        for w in widgets:
+            w.blockSignals(True)
+        try:
+            if 'buy_click_delay' in cfg:
+                self.buy_click_delay = float(cfg['buy_click_delay'])
+                self.delay_spin.setValue(self.buy_click_delay)
+            if 'buy_to_verify_delay' in cfg:
+                self.buy_to_verify_delay = float(cfg['buy_to_verify_delay'])
+                self.buy_to_verify_spin.setValue(self.buy_to_verify_delay)
+            if 'buy_interval' in cfg:
+                self.buy_interval = float(cfg['buy_interval'])
+                self.buy_interval_spin.setValue(self.buy_interval)
+            if 'verify_interval' in cfg:
+                self.verify_interval = float(cfg['verify_interval'])
+                self.verify_interval_spin.setValue(self.verify_interval)
+            if 'buy_clicks' in cfg:
+                self.buy_clicks = int(cfg['buy_clicks'])
+                self.buy_clicks_spin.setValue(self.buy_clicks)
+            if 'verify_clicks' in cfg:
+                self.verify_clicks = int(cfg['verify_clicks'])
+                self.verify_clicks_spin.setValue(self.verify_clicks)
+            if 'ocr_interval' in cfg:
+                self.ocr_interval = float(cfg['ocr_interval'])
+                self.ocr_interval_spin.setValue(self.ocr_interval)
+            if 'price_limit' in cfg:
+                self.price_limit = int(cfg['price_limit'])
+                self.price_limit_spin.setValue(self.price_limit)
+            if 'target_season' in cfg and str(cfg['target_season']).strip():
+                self.target_season = str(cfg['target_season']).strip()
+                self.season_combo.setCurrentText(self.target_season)
+            if 'target_tier' in cfg and cfg['target_tier']:
+                self.target_tier = str(cfg['target_tier'])
+                self.tier_combo.setCurrentText(self.target_tier)
+            if 'target_grade' in cfg and cfg['target_grade']:
+                self.target_grade = str(cfg['target_grade'])
+                self.grade_combo.setCurrentText(self.target_grade)
+            if 'stop_after_count' in cfg:
+                self.stop_after_count = int(cfg['stop_after_count'])
+                self.stop_count_spin.setValue(self.stop_after_count)
+            if 'click_refresh_enabled' in cfg:
+                self.click_refresh_enabled = bool(cfg['click_refresh_enabled'])
+                self.refresh_checkbox.setChecked(self.click_refresh_enabled)
+            if 'follow_only' in cfg:
+                self.follow_only = bool(cfg['follow_only'])
+                self.follow_only_checkbox.setChecked(self.follow_only)
+            if 'market_close_time' in cfg:
+                self.market_close_time = str(cfg['market_close_time']).strip()
+                self.market_close_edit.setText(self.market_close_time)
+            if 'market_open_time' in cfg:
+                self.market_open_time = str(cfg['market_open_time']).strip()
+                self.market_open_edit.setText(self.market_open_time)
+        finally:
+            for w in widgets:
+                w.blockSignals(False)
     
     def get_config(self):
         """获取当前配置"""
